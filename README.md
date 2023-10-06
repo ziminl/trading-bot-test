@@ -8,3 +8,8 @@ binance and okx in first, and then i ll move to each folders, and continue dev.
 
 ##4 oct 2023
 way to collect all coin's rsi price or other 
+
+
+# ta-lab install 
+https://www.youtube.com/watch?v=30BaSfz0FGE
+https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
