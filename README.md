@@ -17,3 +17,9 @@ https://www.lfd.uci.edu/~gohlke/pythonlibs/#ta-lib
 
 #code trading
 https://www.programcreek.com/python/index/7769/talib
+
+#tips
+
+binance error fix in colab
+
+colab runtime limit is max 12 hours
