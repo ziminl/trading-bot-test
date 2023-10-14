@@ -23,3 +23,14 @@ https://www.programcreek.com/python/index/7769/talib
 binance error fix in colab
 
 colab runtime limit is max 12 hours
+
+
+
+# strategy
+rsi
+macd
+sma
+ema
+bb
+
+
