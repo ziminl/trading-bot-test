@@ -38,5 +38,9 @@ ema
 
 bb
 
+# risk management
 
+
+
+#
 
