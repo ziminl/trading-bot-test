@@ -44,5 +44,12 @@ stoch rsi
 
 
 
+
+# platform ta
+tradingview ta
+https://tradingview.com/markets/cryptocurrencies/prices-all/
+
+
+
 #
 
