@@ -38,6 +38,8 @@ ema
 
 bb
 
+stoch rsi
+
 # risk management
 
 
