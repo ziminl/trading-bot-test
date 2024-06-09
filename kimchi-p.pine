@@ -1,0 +1,86 @@
+//@version=5
+indicator('kimchi premium percent / coinbase-cobit(korean exchange)', scale=scale.right)
+
+dollar = input.symbol(title='Dollar/KRW', defval='USDKRW')
+dollar_value = request.security(dollar, timeframe.period, close)
+
+btcusdt = input.symbol(title='BTCUSDT', defval='BINANCE:BTCUSDT')
+btcusdt_value = request.security(btcusdt, timeframe.period, close)
+
+usdtusd = input.symbol(title='USDTUSD', defval='BITSTAMP:USDTUSD')
+usdt_usd_value = request.security(usdtusd, timeframe.period, close)
+
+btckrw = input.symbol(title='BTCKRW', defval='UPBIT:BTCKRW')
+btckrw_value = request.security(btckrw, timeframe.period, close)
+
+converted = btcusdt_value * usdt_usd_value * dollar_value
+
+diff = (btckrw_value - converted) / 1000000
+
+diff_color = input(title='diff value color', defval=color.gray)
+plot(diff, color=diff_color, title='kimchi diff value', display=display.none)
+
+getDiff(symbol) =>
+    temp_value = request.security(symbol, timeframe.period, close)
+    prev_temp_value = request.security(symbol, timeframe.period, close[1])
+
+    temp_value - prev_temp_value
+
+premium_btc = (btckrw_value - converted) / converted * 100
+
+premium = premium_btc
+
+ema_length = input.int(title='EMA Length', defval=200, minval=10)
+symbol_ema = ta.ema(premium, ema_length)
+
+hcolor = input(title='upper value for color', defval=2.0)
+lcolor = input(title='lower value for color', defval=0.0)
+
+changed_usdt = getDiff('BINANCE:BTCUSDT')
+changed_kRW = getDiff('UPBIT:BTCKRW')
+
+ema_color = input(title='ema color 1', defval=color.white)
+if changed_usdt * changed_kRW < 0
+    ema_color := input(title='ema color 2', defval=color.red)
+    ema_color
+
+premium_color = input(title='premium color 1', defval=color.green)
+if premium > hcolor
+    premium_color := input(title='premium color 2', defval=color.red)
+    premium_color
+else if premium < lcolor
+    premium_color := input(title='premium color 3', defval=color.blue)
+    premium_color
+
+plot(premium, color=color.new(premium_color, 0), title='kimchi premium', style=plot.style_columns)
+plot(symbol_ema, color=color.new(ema_color, 0), style=plot.style_linebr, title='ema', linewidth=2)
+
+// text = high : / date :
+// text = low : / date :
+// text = current : / date :
+
+is_view_zeroLine = input(title='represent zero line', defval=false)
+zero_line_color = input(title='zero line color', defval=color.silver)
+
+intv_local_maximum = input(title='Interval to find the maximum value(local minimum):', defval=240)
+intv_local_minimum = input(title='Interval to find the minimum value(local maximum):', defval=240)
+
+if is_view_zeroLine
+    var line zero_line = na
+    line.set_x2(zero_line, bar_index)
+    zero_line := line.new(bar_index, 0.0, bar_index, 0.0, extend=extend.both, color=zero_line_color)
+    zero_line
+
+var premium_table = table.new(position = position.top_left, columns = 2, rows = 4, bgcolor = color.rgb(95,95,95), border_width = 1, frame_color = color.yellow, border_color = color.yellow, frame_width = 1)
+highest_pre = ta.highest(premium, 240) 
+lowest_pre = ta.lowest(premium, 240)
+
+table.merge_cells(premium_table, 0, 0, 1, 0)
+table.cell(table_id = premium_table, column = 0, row = 0, text = "Kimchi premium", text_color = color.white, bgcolor = color.black)
+table.cell(table_id = premium_table, column = 0, row = 1, text = "current", text_color = color.white)
+table.cell(table_id = premium_table, column = 0, row = 2, text = "local maximum", text_color = color.white)
+table.cell(table_id = premium_table, column = 0, row = 3, text = "local minimum", text_color = color.white)
+
+table.cell(table_id = premium_table, column = 1, row = 1, text = str.tostring(math.round(premium_btc * 100) / 100) + " %", text_color = color.white, text_size = size.large, text_halign = text.align_right)
+table.cell(table_id = premium_table, column = 1, row = 2, text = str.tostring(math.round(highest_pre * 100) / 100) + " %", text_color = color.white, text_size = size.large, text_halign = text.align_right)
+table.cell(table_id = premium_table, column = 1, row = 3, text = str.tostring(math.round(lowest_pre * 100) / 100) + " %", text_color = color.white, text_size = size.large, text_halign = text.align_right)
