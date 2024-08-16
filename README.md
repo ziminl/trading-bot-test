@@ -51,5 +51,7 @@ https://tradingview.com/markets/cryptocurrencies/prices-all/
 
 
 
-#
+#todo 
+
+optimization theory
 
