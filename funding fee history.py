@@ -1,36 +1,29 @@
-#to compare spot vs future
-
-import ccxt
-from datetime import datetime
+import requests
 import pandas as pd
 
-api_key = 'your_api_key'
-api_secret = 'your_api_secret'
 
-exchange = ccxt.binance({
-    'apiKey': api_key,
-    'secret': api_secret,
-    'options': {
-        'defaultType': 'future'
-    }
-})
+symbol = 'BTCUSDT'
 
 def get_funding_fee_history(symbol, limit=10):
+    url = 'https://fapi.binance.com/fapi/v1/fundingRate'
+    params = {
+        'symbol': symbol,
+        'limit': limit
+    }
+    
     try:
-        funding_fee_history = exchange.fapiPrivate_get_fundingrate({
-            'symbol': symbol,
-            'limit': limit
-        })
+        response = requests.get(url, params=params)
+        response.raise_for_status()
+        funding_fee_history = response.json()
         
         df = pd.DataFrame(funding_fee_history)
         df['fundingTime'] = pd.to_datetime(df['fundingTime'], unit='ms')
         return df
     
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         print(f"Error fetching funding fee history: {e}")
         return None
 
-symbol = 'BTCUSDT'
 funding_fee_history = get_funding_fee_history(symbol, limit=10)
 
 if funding_fee_history is not None and not funding_fee_history.empty:
