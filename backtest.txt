@@ -1,0 +1,140 @@
+#!/usr/bin/env python3
+import pandas as pd
+import numpy as np
+import traceback
+import torch
+from tqdm import tqdm
+import time
+import matplotlib.pyplot as plt
+from UtilityModule import get_candle_data_v5, calculate_indicators, add_debug_log, get_cached_fear_greed_index, calculate_atr_from_symbol
+from FusionRLAgent import HybridRLAgent
+from config import SYMBOL_CONFIG, DEFAULT_MARKET_REGIME
+from state_vector import generate_state_vector_from_df
+
+def generate_state_vector_for_backtest(df, idx):
+    base_vector = generate_state_vector_from_df(df, idx)
+    return np.concatenate((base_vector, np.zeros(3, dtype=np.float32)))
+
+def run_backtest_improved(model, df, symbol, plot_results=False):
+    total_trades = 0
+    wins = 0
+    losses = 0
+    initial_balance = 1000.0
+    balance = initial_balance
+    max_drawdown = 0.0
+    trade_entries = []
+    df = calculate_indicators(df)
+    n = len(df)
+    if n < 60:
+        raise ValueError("Insufficient data length")
+    state_cache = [generate_state_vector_for_backtest(df, i) for i in range(n)]
+    pbar = tqdm(range(10, n - 1), desc="Backtest", unit="step")
+    i = 10
+    while i < n - 1:
+        state_seq = np.array(state_cache[i-10:i], dtype=np.float32)
+        market_regime = DEFAULT_MARKET_REGIME
+        with torch.no_grad():
+            action = model.get_action(state_seq, market_regime=market_regime, current_step=i)
+        if action == 4:
+            i += 1
+            pbar.update(1)
+            continue
+        entry_price = df.iloc[i]['close']
+        position_side = "long" if action == 0 else "short"
+        total_trades += 1
+        j = i + 1
+        exit_price = None
+        entry_index = i
+        atr_value = df.iloc[i]['atr'] if 'atr' in df.columns else 1.0
+        leverage = SYMBOL_CONFIG[symbol].get("leverage", 75)
+        stop_loss_threshold = -1.0 * atr_value * leverage
+        take_profit_threshold = 2.5 * atr_value * leverage
+        position_size = 1.0
+        max_roi = 0.0
+        trailing_threshold = 0.3
+        while j < n:
+            current_price = df.iloc[j]['close']
+            if position_side == "long":
+                raw_roi = ((current_price - entry_price) / entry_price) * leverage * 100
+            else:
+                raw_roi = ((entry_price - current_price) / entry_price) * leverage * 100
+            net_roi = raw_roi - (0.075 * leverage * 2)
+            max_roi = max(max_roi, net_roi)
+            if net_roi < stop_loss_threshold or net_roi > take_profit_threshold:
+                exit_price = current_price
+                break
+            if max_roi > 10 and (max_roi - net_roi) > trailing_threshold * max_roi:
+                exit_price = current_price
+                break
+            if j - i >= 60:
+                exit_price = current_price
+                break
+            j += 1
+        if exit_price is None:
+            exit_price = df.iloc[-1]['close']
+        if position_side == "long":
+            trade_roi = ((exit_price - entry_price) / entry_price) * 100
+        else:
+            trade_roi = ((entry_price - exit_price) / entry_price) * 100
+        balance *= (1 + trade_roi/100 * position_size)
+        if trade_roi > 0:
+            wins += 1
+        else:
+            losses += 1
+        drawdown = (balance - initial_balance) / initial_balance * 100
+        max_drawdown = min(max_drawdown, drawdown)
+        next_state = np.array(state_cache[j-10:j], dtype=np.float32) if j < n else state_seq
+        model.remember(symbol, entry_price, exit_price, position_side, state_seq, action, next_state, done=0, current_step=i)
+        trade_entries.append({
+            "entry_index": entry_index,
+            "exit_index": j,
+            "entry_price": entry_price,
+            "exit_price": exit_price,
+            "side": position_side
+        })
+        i = j + 1
+        pbar.update(max(j - i, 1))
+    pbar.close()
+    win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
+    roi = (balance - initial_balance) / initial_balance * 100
+    print(f"Total Trades: {total_trades}")
+    print(f"Win Rate: {win_rate:.2f}%")
+    print(f"ROI: {roi:.2f}%")
+    print(f"Max Drawdown: {max_drawdown:.2f}%")
+    if plot_results:
+        plot_backtest_results(df, trade_entries)
+    return {"roi": roi, "win_rate": win_rate, "max_drawdown": max_drawdown}
+
+def plot_backtest_results(df, trade_entries):
+    plt.figure(figsize=(12,6))
+    plt.plot(df.index, df['close'], label='Close Price')
+    for trade in trade_entries:
+        entry_idx = trade['entry_index']
+        exit_idx = trade['exit_index']
+        entry_price = trade['entry_price']
+        exit_price = trade['exit_price']
+        plt.scatter(df.index[entry_idx], entry_price, color='green', marker='^', label='Entry' if 'Entry' not in plt.gca().get_legend_handles_labels()[1] else "")
+        plt.scatter(df.index[exit_idx], exit_price, color='red', marker='v', label='Exit' if 'Exit' not in plt.gca().get_legend_handles_labels()[1] else "")
+    plt.title('Backtest Trade Points')
+    plt.xlabel('Time')
+    plt.ylabel('Price')
+    plt.legend()
+    plt.show()
+
+if __name__ == "__main__":
+    symbol = "AI16ZUSDT"
+    try:
+        print(f"{symbol} 15분봉 데이터 로드 중...")
+        df = get_candle_data_v5(symbol, "15", limit=1000)
+        if df.empty:
+            raise ValueError("데이터 로드 실패!")
+        fusion_rl_agent = HybridRLAgent(state_dim=17, action_dim=5, lr=1e-3, gamma=0.98)
+        fusion_rl_agent.load("pretrained_fusion_rl_agent.pt")
+        test_results = run_backtest_improved(fusion_rl_agent, df, symbol, plot_results=True)
+        print("\n백테스트 결과")
+        print(f"ROI: {test_results['roi']:.2f}%")
+        print(f"Win Rate: {test_results['win_rate']:.2f}%")
+        print(f"Max Drawdown: {test_results['max_drawdown']:.2f}%")
+    except Exception as e:
+        print("오류 발생!")
+        print(traceback.format_exc())

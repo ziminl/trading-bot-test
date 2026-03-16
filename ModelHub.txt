@@ -1,0 +1,160 @@
+import threading
+import time
+import os
+from UtilityModule import add_debug_log, get_candle_data_v5, calculate_indicators
+from config import SYMBOL_CONFIG
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, BatchNormalization, Concatenate
+
+class MultiTimeframeLSTMModel:
+    def __init__(self, window_size=10, feature_columns=["open", "high", "low", "close", "volume"], model_path="multitimeframe_lstm_model.h5"):
+        self.window_size = window_size
+        self.feature_columns = feature_columns
+        self.model_path = model_path
+        self.model = self.build_model()
+    
+    def build_model(self):
+        input1 = Input(shape=(self.window_size, len(self.feature_columns)), name="input_1m")
+        x1 = LSTM(64, return_sequences=True)(input1)
+        x1 = BatchNormalization()(x1)
+        x1 = Dropout(0.2)(x1)
+        x1 = LSTM(64)(x1)
+        x1 = BatchNormalization()(x1)
+        x1 = Dropout(0.2)(x1)
+        
+        input5 = Input(shape=(self.window_size, len(self.feature_columns)), name="input_5m")
+        x5 = LSTM(64, return_sequences=True)(input5)
+        x5 = BatchNormalization()(x5)
+        x5 = Dropout(0.2)(x5)
+        x5 = LSTM(64)(x5)
+        x5 = BatchNormalization()(x5)
+        x5 = Dropout(0.2)(x5)
+        
+        input15 = Input(shape=(self.window_size, len(self.feature_columns)), name="input_15m")
+        x15 = LSTM(64, return_sequences=True)(input15)
+        x15 = BatchNormalization()(x15)
+        x15 = Dropout(0.2)(x15)
+        x15 = LSTM(64)(x15)
+        x15 = BatchNormalization()(x15)
+        x15 = Dropout(0.2)(x15)
+        
+        concat = Concatenate()([x1, x5, x15])
+        output = Dense(1, activation="linear")(concat)
+        model = Model(inputs=[input1, input5, input15], outputs=output)
+        model.compile(loss="mean_squared_error", optimizer="adam")
+        add_debug_log("MultiTimeframeLSTM", "모델생성", f"모델 생성 완료 (window_size: {self.window_size})", level="critical")
+        return model
+    
+    def load(self):
+        if os.path.exists(self.model_path):
+            try:
+                self.model = load_model(self.model_path)
+                add_debug_log("MultiTimeframeLSTM", "로드", f"모델 로드 완료: {self.model_path}", level="critical")
+            except Exception as e:
+                add_debug_log("MultiTimeframeLSTM", "오류", f"모델 로드 실패: {e}", level="critical")
+    
+    def train(self, X_train, y_train, epochs=50, batch_size=32):
+        self.model.fit(X_train, y_train, epochs=epochs, batch_size=batch_size, verbose=1)
+        self.save()
+    
+    def save(self):
+        self.model.save(self.model_path)
+    
+    def predict(self, X):
+        return self.model.predict(X)
+
+class ModelHub:
+    def __init__(self, stop_event=None, model_path="multitimeframe_lstm_model.h5", check_interval=60, train_interval=600):
+        self.model_path = model_path
+        self.check_interval = check_interval
+        self.train_interval = train_interval  # LSTM 학습 주기 (초)
+        self.model = None
+        self.last_modified = None
+        self.lock = threading.Lock()
+        self.stop_event = stop_event if stop_event else threading.Event()
+        self.load_model()
+        self.monitor_thread = threading.Thread(target=self._monitor_model, daemon=True)
+        self.monitor_thread.start()
+        self.train_thread = threading.Thread(target=self._train_model_periodically, daemon=True)
+        self.train_thread.start()
+
+    def load_model(self):
+        with self.lock:
+            if os.path.exists(self.model_path):
+                try:
+                    self.model = MultiTimeframeLSTMModel(model_path=self.model_path)
+                    self.model.load()
+                    self.last_modified = os.path.getmtime(self.model_path)
+                    add_debug_log("ModelHub", "Load", f"모델 {self.model_path} 로드 완료.", level="critical")
+                except Exception as e:
+                    add_debug_log("ModelHub", "LoadError", f"모델 로드 실패: {e}", level="critical")
+                    self.model = None
+            else:
+                add_debug_log("ModelHub", "경고", f"{self.model_path} 모델 파일 없음 → 학습 후 생성됨.", level="warning")
+                self.model = MultiTimeframeLSTMModel(model_path=self.model_path)
+                self.model.save()
+
+    def _monitor_model(self):
+        while not self.stop_event.is_set():
+            time.sleep(self.check_interval)
+            if os.path.exists(self.model_path):
+                current_mod = os.path.getmtime(self.model_path)
+                if self.last_modified is None or current_mod > self.last_modified:
+                    add_debug_log("ModelHub", "Monitor", "새 모델 파일 감지, 재로딩 수행.", level="critical")
+                    self.load_model()
+
+    def _train_model_periodically(self):
+        while not self.stop_event.is_set():
+            time.sleep(self.train_interval)
+            if self.model:
+                try:
+                    train_data = self._get_latest_training_data()
+                    if train_data is None:
+                        add_debug_log("LSTM", "데이터 부족", "훈련 데이터 부족으로 학습 스킵", level="warning")
+                        continue
+                    self.model.train(train_data, epochs=5, batch_size=32)
+                    self.model.save()
+                    add_debug_log("ModelHub", "Train", "LSTM 모델 10분마다 재학습 완료", level="critical")
+                except Exception as e:
+                    add_debug_log("ModelHub", "TrainError", f"LSTM 학습 실패: {e}", level="critical")
+
+    def _get_latest_training_data(self):
+        import numpy as np  # 수정: np를 여기서 import 합니다.
+        from UtilityModule import get_candle_data_v5
+        symbols = list(SYMBOL_CONFIG.keys())
+        window_size = 10
+        train_data = {"1m": [], "5m": [], "15m": []}
+        for symbol in symbols:
+            df_1m = get_candle_data_v5(symbol, "1", limit=window_size)
+            df_5m = get_candle_data_v5(symbol, "5", limit=window_size)
+            df_15m = get_candle_data_v5(symbol, "15", limit=window_size)
+            if not df_1m.empty and not df_5m.empty and not df_15m.empty:
+                feature_columns = ["open", "high", "low", "close", "volume"]
+                # 간단한 정규화 예시: (값 - 평균) / 표준편차
+                def normalize(df):
+                    norm_df = df.copy()
+                    for col in feature_columns:
+                        norm_df[col] = (norm_df[col] - norm_df[col].mean()) / (norm_df[col].std() + 1e-6)
+                    return norm_df
+                norm_1m = normalize(df_1m[feature_columns]).values
+                norm_5m = normalize(df_5m[feature_columns]).values
+                norm_15m = normalize(df_15m[feature_columns]).values
+                train_data["1m"].append(norm_1m)
+                train_data["5m"].append(norm_5m)
+                train_data["15m"].append(norm_15m)
+        if not train_data["1m"] or not train_data["5m"] or not train_data["15m"]:
+            add_debug_log("LSTM", "데이터 부족", "훈련 데이터 부족 → 학습 불가", level="warning")
+            return None
+        # 실제 상황에 맞게 numpy 배열로 변환
+        train_data["1m"] = np.array(train_data["1m"])
+        train_data["5m"] = np.array(train_data["5m"])
+        train_data["15m"] = np.array(train_data["15m"])
+        # y_train은 별도 정의(예: 다음 캔들 종가 예측) – 여기서는 placeholder로 처리
+        y_train = np.zeros((train_data["1m"].shape[0], 1))
+        return ({"1m": train_data["1m"], "5m": train_data["5m"], "15m": train_data["15m"]}, y_train)
+
+    def get_model(self):
+        with self.lock:
+            return self.model
+
+model_hub = ModelHub()

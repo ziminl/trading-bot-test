@@ -1,0 +1,243 @@
+#!/usr/bin/env python3
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import random, numpy as np, time
+from UtilityModule import add_debug_log
+from config import SYMBOL_CONFIG
+
+class CriticHead(nn.Module):
+    def __init__(self, hidden_dim, action_dim, dropout_prob):
+        super(CriticHead, self).__init__()
+        self.value = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.adv = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+    def forward(self, shared):
+        v = self.value(shared)
+        a = self.adv(shared)
+        q = v + a - a.mean(dim=1, keepdim=True)
+        return q
+
+class HybridRLAgent(nn.Module):
+    def __init__(self, state_dim=17, hidden_dim=256, lstm_layers=2, action_dim=5,
+                 dropout_prob=0.2, lr=1e-3, gamma=0.98, target_update_freq=1000):
+        super(HybridRLAgent, self).__init__()
+        self.gamma = gamma
+        self.lr = lr
+        self.target_update_freq = target_update_freq
+        self.learn_steps = 0
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.dropout1 = nn.Dropout(dropout_prob)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers=lstm_layers, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout_prob)
+        self.actor_fc = nn.Linear(hidden_dim, hidden_dim // 2)
+        self.actor_dropout = nn.Dropout(dropout_prob)
+        self.actor_out = nn.Linear(hidden_dim // 2, action_dim)
+        self.critic_value = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        self.critic_adv = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        self.optimizer = optim.Adam(self.parameters(), lr=self.lr, weight_decay=1e-5)
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, mode='min', factor=0.5, patience=500, verbose=True, min_lr=1e-7)
+        self.buffer = []
+        self.buffer_capacity = 10000
+        self.total_trades = 0
+        self.loss_streak = 0
+        self.win_count = 0
+        self.epsilon = 1.0
+        self.epsilon_min = 0.05
+        self.last_trade_step = -1000
+        self.target_critic = CriticHead(hidden_dim, action_dim, dropout_prob)
+        self.update_target_network()
+
+    def forward_shared(self, x):
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout1(x)
+        x, _ = self.lstm(x)
+        x = self.dropout2(x)
+        shared = x[:, -1, :]
+        return shared
+
+    def forward_actor(self, shared):
+        x = self.actor_fc(shared)
+        x = F.relu(x)
+        x = self.actor_dropout(x)
+        logits = self.actor_out(x)
+        probs = F.softmax(logits, dim=1)
+        return probs
+
+    def forward_critic(self, shared):
+        value = self.critic_value(shared)
+        adv = self.critic_adv(shared)
+        q_values = value + adv - adv.mean(dim=1, keepdim=True)
+        state_value = value + adv.mean(dim=1, keepdim=True)
+        return q_values, state_value
+
+    def forward(self, x, hidden=None):
+        shared = self.forward_shared(x)
+        actor_probs = self.forward_actor(shared)
+        q_values, state_value = self.forward_critic(shared)
+        return actor_probs, q_values, state_value
+
+    def get_action(self, state_seq, market_regime=None, current_step=0, deterministic=False):
+        self.eval()
+        state_tensor = torch.FloatTensor(state_seq).unsqueeze(0)
+        with torch.no_grad():
+            actor_probs, _, _ = self.forward(state_tensor)
+        self.train()
+        probs = actor_probs.cpu().numpy()[0]
+        if market_regime is not None:
+            if market_regime.lower() == "bearish":
+                probs[0] *= 0.5
+            elif market_regime.lower() == "bullish":
+                probs[2] *= 0.5
+            probs = probs / probs.sum()
+        if deterministic:
+            action = int(np.argmax(probs))
+        else:
+            action = int(np.random.choice(len(probs), p=probs))
+        add_debug_log("HybridRLAgent", "get_action", f"[Step={current_step}] MarketRegime={market_regime}, 선택된 액션={action}, 확률={probs}")
+        return action
+
+    def update_target_network(self):
+        self.target_critic.load_state_dict(self.get_critic_head().state_dict())
+        add_debug_log("HybridRLAgent", "Target Update", "타깃 네트워크 업데이트 완료", level="info")
+
+    def get_critic_head(self):
+        critic_head = CriticHead(self.lstm.hidden_size, self.actor_out.out_features, 0.2)
+        critic_head.load_state_dict(self.target_critic.state_dict())
+        return critic_head
+
+    def remember(self, symbol, entry_price, exit_price, side, state, action, next_state, done,
+                 trading_fee=0.075, market_regime="neutral", current_step=0, current_unrealized_pnl=None):
+        # state, next_state가 None이면 기본값(0으로 채워진 배열)으로 대체
+        if state is None:
+            state = np.zeros((10, self.fc1.in_features), dtype=np.float32)
+        if next_state is None:
+            next_state = np.zeros((10, self.fc1.in_features), dtype=np.float32)
+        reward = self.calc_custom_reward(entry_price, exit_price, side, symbol, trading_fee, market_regime, action, current_unrealized_pnl)
+        if current_step - self.last_trade_step < 3:
+            reward -= 1.5
+        if action in [0, 2]:
+            self.last_trade_step = current_step
+        experience = (symbol, state, action, reward, next_state, done)
+        if len(self.buffer) >= self.buffer_capacity:
+            self.buffer.pop(0)
+        self.buffer.append(experience)
+        self.total_trades += 1
+
+
+    def calc_custom_reward(self, entry_price, exit_price, side, symbol, trading_fee=0.075,
+                             market_regime="neutral", action=None, current_unrealized_pnl=None):
+        leverage = SYMBOL_CONFIG.get(symbol, {}).get("leverage", 75)
+        if side.lower() == "long":
+            raw_roi = ((exit_price - entry_price) / entry_price) * leverage * 100
+        elif side.lower() == "short":
+            raw_roi = ((entry_price - exit_price) / entry_price) * leverage * 100
+        else:
+            raw_roi = 0.0
+        net_roi = raw_roi - (trading_fee * leverage * 2)
+        midterm_reward = 0.0
+        if current_unrealized_pnl is not None:
+            midterm_reward = 0.1 * current_unrealized_pnl
+        bonus = (net_roi - 50) * 2.0 if net_roi > 50 else 0.0
+        penalty = -1 if action in [0, 2] else 0
+        reward = net_roi + midterm_reward + bonus + penalty
+        return reward
+
+    def update_on_policy(self):
+        if len(self.buffer) == 0:
+            return None
+
+        returns = []
+        R = 0
+        # 튜플 구조: (symbol, state, action, reward, next_state, done)
+        # 여기서 reward와 done을 뒤에서부터 읽어 returns 계산
+        for _, _, _, reward, _, done in reversed(self.buffer):
+            R = reward + self.gamma * R * (1 - done)
+            returns.insert(0, R)
+        returns = torch.FloatTensor(returns)
+
+        # buffer에 있는 데이터를 실제 변수에 맞춰 할당
+        # (symbols, states, actions, rewards, next_states, dones) = zip(*self.buffer)
+        symbols, states, actions, rewards, next_states, dones = zip(*self.buffer)
+
+        # 상태와 액션을 텐서로 변환
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor(np.array(actions))
+
+        # Critic 업데이트
+        shared_states = self.forward_shared(states)
+        _, state_values = self.forward_critic(shared_states)
+        state_values = state_values.squeeze(1)
+        advantages = returns - state_values.detach()
+
+        # Actor 업데이트
+        actor_probs, _, _ = self.forward(states)
+        dist = torch.distributions.Categorical(actor_probs)
+        log_probs = dist.log_prob(actions)
+        actor_loss = -(log_probs * advantages).mean()
+        critic_loss = nn.MSELoss()(state_values, returns)
+
+        entropy = dist.entropy().mean()
+        entropy_bonus = 0.01 * entropy
+        total_loss = actor_loss + critic_loss - entropy_bonus
+
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=10)
+        self.optimizer.step()
+
+        self.learn_steps += 1
+        if self.learn_steps % self.target_update_freq == 0:
+            self.update_target_network()
+        self.scheduler.step(total_loss)
+        self.update_epsilon()
+
+        self.buffer = []
+        return total_loss.item()
+
+    def update_epsilon(self):
+        if self.total_trades < 50:
+            self.epsilon = max(self.epsilon * 0.95, self.epsilon_min)
+        else:
+            recent_win_rate = (self.win_count / self.total_trades * 100) if self.total_trades > 0 else 0
+            if recent_win_rate > 55:
+                self.epsilon = max(self.epsilon * 0.9, self.epsilon_min)
+            else:
+                self.epsilon = max(self.epsilon * 0.98, self.epsilon_min)
+
+    def save(self, filename="hybrid_rl_agent.pt"):
+        torch.save({
+            "model_state_dict": self.state_dict(),
+            "target_state_dict": self.target_critic.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "epsilon": self.epsilon
+        }, filename)
+        add_debug_log("HybridRLAgent", "Save", f"모델 저장됨: {filename}")
+
+    def load(self, filename="hybrid_rl_agent.pt"):
+        try:
+            checkpoint = torch.load(filename)
+            self.load_state_dict(checkpoint["model_state_dict"])
+            self.target_critic.load_state_dict(checkpoint["target_state_dict"])
+            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            self.epsilon = checkpoint.get("epsilon", self.epsilon)
+            add_debug_log("HybridRLAgent", "Load", f"모델 로드됨: {filename}")
+        except Exception as e:
+            add_debug_log("HybridRLAgent", "Error", f"모델 로드 실패: {e}", level="critical")

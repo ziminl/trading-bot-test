@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import numpy as np
+import torch
+import time
+import pandas as pd
+from UtilityModule import get_candle_data_v5, calculate_indicators, add_debug_log, validate_state_vector
+from state_vector import generate_state_vector_from_df
+from FusionRLAgent import HybridRLAgent
+from config import SYMBOL_CONFIG, DEFAULT_MARKET_REGIME, NUM_ITERATIONS, BATCH_SIZE, PATIENCE
+
+def pretrain_rl_agent(symbol, historical_interval="15", limit=1000, num_episodes=1000):
+    print(f"Loading historical data for {symbol} using {historical_interval} interval...")
+    df = get_candle_data_v5(symbol, historical_interval, limit)
+    if df.empty:
+        print("Historical data load failed.")
+        return
+    df = calculate_indicators(df)
+    print(f"Loaded {len(df)} candles.")
+    agent = HybridRLAgent(state_dim=17, action_dim=5, lr=1e-3)
+    state_vectors = []
+    for i in range(len(df)):
+        try:
+            base_vector = generate_state_vector_from_df(df, i)
+            state_vector = np.concatenate((base_vector, np.zeros(3, dtype=np.float32)))
+        except Exception as e:
+            add_debug_log("Pretraining", "State Vector Error", f"Error: {e}")
+            state_vector = np.zeros(17, dtype=np.float32)
+        if validate_state_vector(state_vector):
+            state_vectors.append(state_vector)
+        else:
+            state_vectors.append(np.zeros(17, dtype=np.float32))
+    episode_length = 10
+    best_loss = float('inf')
+    for ep in range(num_episodes):
+        start_idx = np.random.randint(episode_length, len(state_vectors) - episode_length)
+        for t in range(episode_length):
+            idx = start_idx + t
+            state_seq = np.array(state_vectors[idx-episode_length:idx], dtype=np.float32)
+            next_state = np.array(state_vectors[idx-episode_length+1:idx+1], dtype=np.float32)
+            action = agent.get_action(state_seq, market_regime=DEFAULT_MARKET_REGIME, current_step=ep*episode_length+t)
+            if action in [0, 2]:
+                entry_price = df.iloc[idx]['close']
+                exit_price = df.iloc[min(idx+5, len(df)-1)]['close']
+                side = "long" if action == 0 else "short"
+                agent.remember(symbol, entry_price, exit_price, side, state_seq, action, next_state, done=0)
+            else:
+                agent.remember(symbol, 0, 0, "hold", state_seq, action, next_state, done=0)
+        loss = agent.update_on_policy()
+        if loss is not None and loss < best_loss:
+            best_loss = loss
+        if (ep+1) % 100 == 0:
+            print(f"Episode {ep+1}/{num_episodes} - Loss: {loss:.4f}, Best Loss: {best_loss:.4f}")
+    agent.save("pretrained_fusion_rl_agent.pt")
+    print("Pretraining completed. Model saved as 'pretrained_fusion_rl_agent.pt'.")
+
+if __name__ == "__main__":
+    symbol = "AI16ZUSDT"
+    pretrain_rl_agent(symbol)

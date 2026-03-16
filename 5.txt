@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+import os, threading, time, math, random, logging, datetime, requests, pandas as pd, numpy as np
+from config import SYMBOL_CONFIG, STRATEGY_COOLDOWN, LOSS_COOLDOWN, LSTM_WINDOW_SIZE, MIN_HOLD_TIME
+from tensorflow.keras.models import Model, load_model
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, BatchNormalization, Concatenate
+
+LSTM_WINDOW_SIZE = 10
+BASE_URL = "https://api.bybit.com"
+
+# 글로벌 신호 메모리
+ALT_SIGNAL_MEMORY = {}
+LSTM_SIGNAL_MEMORY = {}
+
+# --- 로깅 및 디버그 ---
+def setup_logger(log_file="q1.log"):
+    logger = logging.getLogger()
+    logger.setLevel(logging.INFO)
+    if logger.handlers:
+        logger.handlers.clear()
+    stream_handler = logging.StreamHandler()
+    stream_handler.setLevel(logging.INFO)
+    stream_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    stream_handler.setFormatter(stream_format)
+    logger.addHandler(stream_handler)
+    file_handler = logging.FileHandler("q1_trade.log", encoding='utf-8')
+    file_handler.setLevel(logging.INFO)
+    file_format = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    file_handler.setFormatter(file_format)
+    logger.addHandler(file_handler)
+
+def add_debug_log(category, action, message, level="info"):
+    log_msg = f"[{category}] {action} → {message}"
+    if level.lower() == "debug":
+        logging.debug(log_msg)
+    elif level.lower() == "info":
+        logging.info(f"🟢 {log_msg}")
+    elif level.lower() == "warning":
+        logging.warning(f"⚠️ {log_msg}")
+    elif level.lower() == "error":
+        logging.error(f"❌ {log_msg}")
+    elif level.lower() == "critical":
+        logging.critical(f"🔥 {log_msg}")
+    else:
+        logging.info(f"ℹ️ {log_msg}")
+
+# --- 레버리지 반영 보상 함수 ---
+def calculate_reward(entry_price, exit_price, side, symbol, trading_fee=0.075, market_regime="neutral"):
+    """
+    보상 함수 개선:
+      - 기본 ROI를 계산한 후 시장 상태(market_regime)에 따라 보정을 적용합니다.
+      - bullish 상태에서 LONG이면 보상 15% 강화, SHORT이면 벌점 25% 적용.
+      - bearish 상태에서 SHORT이면 보상 15% 강화, LONG이면 벌점 25% 적용.
+    """
+    leverage = SYMBOL_CONFIG.get(symbol, {}).get("leverage", 75)
+    if entry_price <= 0 or exit_price <= 0:
+        return 0.0
+
+    if side.lower() == "long":
+        raw_roi = ((exit_price - entry_price) / entry_price) * leverage * 100
+    elif side.lower() == "short":
+        raw_roi = ((entry_price - exit_price) / entry_price) * leverage * 100
+    else:
+        raw_roi = 0.0
+
+    effective_fee = trading_fee * leverage
+    net_roi = raw_roi - (effective_fee * 2)
+
+    # 시장 상태 보정
+    if market_regime == "bullish":
+        if side.lower() == "long":
+            net_roi *= 1.15  # LONG 보상 15% 강화
+        elif side.lower() == "short":
+            net_roi *= 0.75  # SHORT 벌점 25% 적용
+    elif market_regime == "bearish":
+        if side.lower() == "short":
+            net_roi *= 1.15  # SHORT 보상 15% 강화
+        elif side.lower() == "long":
+            net_roi *= 0.75  # LONG 벌점 25% 적용
+
+    return net_roi
+
+def get_positions(symbol=None):
+    """
+    Bybit API를 사용하여 현재 활성 포지션을 가져옵니다.
+    필수 파라미터(symbol, settleCoin)를 반드시 포함시킵니다.
+    """
+    try:
+        from pybit.unified_trading import HTTP
+        KEY_FILE = "Testmodekey.txt"
+        with open(KEY_FILE, "r") as f:
+            api_key, api_secret = [line.strip() for line in f.readlines()]
+        session = HTTP(api_key=api_key, api_secret=api_secret)
+        params = {"category": "linear", "settleCoin": "USDT"}
+        if symbol:
+            params["symbol"] = symbol  # 특정 심볼만 조회 가능
+        for attempt in range(3):  # 최대 3번 재시도
+            response = session.get_positions(**params)
+            if response["retCode"] in [0, "0"] and "result" in response:
+                positions = response["result"]["list"]
+                add_debug_log("GetPositions", "성공", f"총 {len(positions)}개 활성 포지션 불러옴.")
+                return positions
+            else:
+                add_debug_log("GetPositions", "오류", f"재시도 {attempt+1}/3: {response}")
+                time.sleep(1)  # 재시도 전 1초 대기
+        return []
+    except Exception as e:
+        add_debug_log("GetPositions", "예외", f"포지션 조회 오류: {e}", level="critical")
+        return []
+
+# --- 기술 지표 계산 ---
+def calculate_indicators(df):
+    try:
+        df.columns = [col.lower() for col in df.columns]
+        for col in ['open', 'high', 'low', 'close', 'volume', 'turnover']:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+        df['bb_mid'] = df['close'].rolling(window=20, min_periods=1).mean()
+        df['bb_std'] = df['close'].rolling(window=20, min_periods=1).std()
+        df['bb_upper'] = df['bb_mid'] + (df['bb_std'] * 2)
+        df['bb_lower'] = df['bb_mid'] - (df['bb_std'] * 2)
+        df['ema10'] = df['close'].ewm(span=10, adjust=False).mean()
+        df['ema30'] = df['close'].ewm(span=30, adjust=False).mean()
+        df['ema12'] = df['close'].ewm(span=12, adjust=False).mean()
+        df['ema26'] = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = df['ema12'] - df['ema26']
+        df['macd_signal'] = df['macd'].ewm(span=12, adjust=False).mean()
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=21, min_periods=5).mean()
+        avg_loss = loss.rolling(window=14, min_periods=1).mean()
+        df['rsi'] = np.where(avg_loss == 0, 100, 100 - (100 / (1 + (avg_gain / avg_loss))))
+        df['atr'] = df[['high', 'low', 'close']].apply(lambda x: max(
+            x['high'] - x['low'], abs(x['high'] - x['close']), abs(x['low'] - x['close'])), axis=1).rolling(window=14, min_periods=1).mean()
+        vol_sum = df['volume'].rolling(window=20, min_periods=1).sum()
+        df['vwap'] = np.where(vol_sum == 0, df['close'],
+                              (df['close'] * df['volume']).rolling(window=20, min_periods=1).sum() / vol_sum)
+        df.dropna(inplace=True)
+    except Exception as e:
+        add_debug_log("Indicator", "계산오류", f"지표 계산 중 오류 발생: {e}", level="error")
+    return df
+
+# --- 캔들 데이터 로드 (Bybit API v5 사용) ---
+def get_candle_data_v5(symbol, interval, limit=500):
+    symbol = symbol.strip()  # 심볼의 불필요한 공백 제거
+    endpoint = "/v5/market/kline"
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        response = requests.get(BASE_URL + endpoint, params=params, timeout=10)
+        if response.status_code != 200:
+            add_debug_log("Kline", "HTTPError", f"{symbol} HTTP Status: {response.status_code}", level="error")
+            return pd.DataFrame()
+        data = response.json()
+        if data.get("retCode") not in [0, "0"] or "result" not in data:
+            add_debug_log("Kline", "오류", f"{symbol} API 오류 또는 데이터 없음: {data}", level="error")
+            return pd.DataFrame()
+        kline_list = data["result"]["list"]
+        if not kline_list:
+            add_debug_log("Kline", "빈 응답", f"{symbol} kline 데이터 없음", level="error")
+            return pd.DataFrame()
+        columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+        df = pd.DataFrame(kline_list, columns=columns)
+        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors='coerce'), unit="ms")
+        df.set_index("timestamp", inplace=True)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df
+    except Exception as e:
+        add_debug_log("Kline", "예외", f"{symbol} {interval} kline API 호출 실패: {e}", level="error")
+        return pd.DataFrame()
+
+# --- 주문장 데이터 조회 (Bybit API v5) ---
+def get_orderbook_data(symbol, depth=5):
+    try:
+        endpoint = "/v5/market/orderbook"
+        params = {"category": "linear", "symbol": symbol, "limit": depth}
+        response = requests.get(BASE_URL + endpoint, params=params, timeout=5)
+        data = response.json()
+        if data.get("retCode") == 0 and "result" in data:
+            orderbook = data["result"]
+            add_debug_log("Orderbook", "조회", f"{symbol} 주문장 데이터 조회 성공")
+            return orderbook
+        else:
+            add_debug_log("Orderbook", "오류", f"{symbol} 주문장 API 오류: {data}", level="critical")
+            return {}
+    except Exception as e:
+        add_debug_log("Orderbook", "예외", f"{symbol} 주문장 데이터 조회 실패: {e}", level="critical")
+        return {}
+
+# --- 심볼별 ATR 계산 ---
+def calculate_atr_from_symbol(symbol, interval="5", limit=100):
+    df = get_candle_data_v5(symbol, interval, limit)
+    if df.empty:
+        return 0.0
+    df = calculate_indicators(df)
+    return df.iloc[-1]["atr"]
+
+# --- 알트코인 시장 데이터 (CoinGecko API v3 사용) ---
+def get_altcoin_market_data():
+    try:
+        global_url = "https://api.coingecko.com/api/v3/global"
+        global_resp = requests.get(global_url, timeout=10)
+        global_data = global_resp.json().get("data", {})
+        total_market_cap = global_data.get("total_market_cap", {}).get("usd", 0)
+        total_volume = global_data.get("total_volume", {}).get("usd", 0)
+        market_cap_change_24h = global_data.get("market_cap_change_percentage_24h_usd", 0)
+        
+        coin_ids = "bitcoin,ethereum,tether"
+        coin_url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_ids}&vs_currencies=usd&include_market_cap=true"
+        coin_resp = requests.get(coin_url, timeout=10)
+        coin_data = coin_resp.json()
+        btc_price = coin_data.get("bitcoin", {}).get("usd", 0)
+        eth_price = coin_data.get("ethereum", {}).get("usd", 0)
+        tether_market_cap = coin_data.get("tether", {}).get("usd_market_cap", 0)
+        
+        eth_btc_ratio = eth_price / btc_price if btc_price > 0 else 0
+        usdt_dominance = (tether_market_cap / total_market_cap * 100) if total_market_cap > 0 else 0
+        
+        return {
+            "TOTAL1": {"current": total_market_cap, "prev": total_market_cap},
+            "TOTAL2": {"current": total_volume, "prev": total_volume},
+            "TOTAL3": {"current": market_cap_change_24h, "prev": market_cap_change_24h},
+            "ETH_BTC": {"current": eth_btc_ratio, "prev": eth_btc_ratio},
+            "USDT_D": {"current": usdt_dominance, "prev": usdt_dominance}
+        }
+    except Exception as e:
+        add_debug_log("AltMarketData", "오류", f"알트코인 데이터 수신 실패: {e}", level="critical")
+        return {
+            "TOTAL1": {"current": 0.0, "prev": 0.0},
+            "TOTAL2": {"current": 0.0, "prev": 0.0},
+            "TOTAL3": {"current": 0.0, "prev": 0.0},
+            "ETH_BTC": {"current": 0.0, "prev": 0.0},
+            "USDT_D": {"current": 0.0, "prev": 0.0}
+        }
+
+# --- State Vector 생성 ---
+def generate_state_vector(symbol, lstm_model=None, position_info=None):
+    # 캔들 데이터 및 기술 지표 기반 상태(14차원) 생성
+    df = get_candle_data_v5(symbol, "5", limit=100)
+    if df.empty:
+        base_state = np.zeros(14, dtype=np.float32)
+    else:
+        df = calculate_indicators(df)
+        last = df.iloc[-1]
+        prev = df.iloc[-2] if len(df) >= 2 else last
+        avg_trend = ((last["close"] - prev["close"]) / prev["close"]) * 100
+        score = calculate_score(df)
+        ema10 = last["ema10"]
+        ema30 = last["ema30"]
+        close = last["close"]
+        rsi = last["rsi"]
+        volume = last["volume"]
+        atr = last["atr"]
+        vwap = last["vwap"]
+        ema240 = df["close"].ewm(span=240, adjust=False).mean().iloc[-1] if len(df) >= 240 else ema30
+        macd = last["macd"]
+        macd_signal = last["macd_signal"]
+        rsi21 = df["rsi"].rolling(window=21).mean().iloc[-1] if len(df) >= 21 else rsi
+
+        alt_data = get_altcoin_market_data()
+        d_total1 = ((alt_data["TOTAL1"]["current"] - alt_data["TOTAL1"]["prev"]) / alt_data["TOTAL1"]["prev"]) * 100 if alt_data["TOTAL1"]["prev"] else 0
+        d_total2 = ((alt_data["TOTAL2"]["current"] - alt_data["TOTAL2"]["prev"]) / alt_data["TOTAL2"]["prev"]) * 100 if alt_data["TOTAL2"]["prev"] else 0
+        d_total3 = ((alt_data["TOTAL3"]["current"] - alt_data["TOTAL3"]["prev"]) / alt_data["TOTAL3"]["prev"]) * 100 if alt_data["TOTAL3"]["prev"] else 0
+        d_eth_btc = ((alt_data["ETH_BTC"]["current"] - alt_data["ETH_BTC"]["prev"]) / alt_data["ETH_BTC"]["prev"]) * 100 if alt_data["ETH_BTC"]["prev"] else 0
+        d_usdt_d = ((alt_data["USDT_D"]["current"] - alt_data["USDT_D"]["prev"]) / alt_data["USDT_D"]["prev"]) * 100 if alt_data["USDT_D"]["prev"] else 0
+        alt_signal = 0.3 * d_total1 + 0.3 * d_total2 + 0.2 * d_total3 + 0.1 * d_eth_btc - 0.3 * d_usdt_d
+
+        smoothing_alpha = 0.3
+        global ALT_SIGNAL_MEMORY
+        if symbol in ALT_SIGNAL_MEMORY:
+            smoothed_alt_signal = smoothing_alpha * alt_signal + (1 - smoothing_alpha) * ALT_SIGNAL_MEMORY[symbol]
+        else:
+            smoothed_alt_signal = alt_signal
+        ALT_SIGNAL_MEMORY[symbol] = smoothed_alt_signal
+
+        tpn_signal = 0.0
+        if lstm_model is not None:
+            try:
+                window_size = 10
+                feature_columns = ["open", "high", "low", "close", "volume"]
+                df1 = get_candle_data_v5(symbol, "1", limit=window_size)
+                df5 = get_candle_data_v5(symbol, "5", limit=window_size)
+                df15 = get_candle_data_v5(symbol, "15", limit=window_size)
+                if not df1.empty and not df5.empty and not df15.empty:
+                    input_seq1 = np.expand_dims(df1[feature_columns].values, axis=0)
+                    input_seq5 = np.expand_dims(df5[feature_columns].values, axis=0)
+                    input_seq15 = np.expand_dims(df15[feature_columns].values, axis=0)
+                    prediction = lstm_model.predict([input_seq1, input_seq5, input_seq15])
+                    current_lstm_signal = prediction[0][0]
+                    smoothing_beta = 0.3
+                    global LSTM_SIGNAL_MEMORY
+                    if symbol in LSTM_SIGNAL_MEMORY:
+                        smoothed_lstm_signal = smoothing_beta * current_lstm_signal + (1 - smoothing_beta) * LSTM_SIGNAL_MEMORY[symbol]
+                    else:
+                        smoothed_lstm_signal = current_lstm_signal
+                    LSTM_SIGNAL_MEMORY[symbol] = smoothed_lstm_signal
+                    tpn_signal = smoothed_lstm_signal
+                    add_debug_log("LSTM", "예측 성공", f"{symbol} LSTM 평활화된 예측값: {tpn_signal}")
+            except Exception as e:
+                add_debug_log("LSTM", "예측 오류", f"{symbol} 예측 실패: {e}", level="critical")
+
+        combined_signal = (smoothed_alt_signal + tpn_signal) * 2.0
+        base_state = np.array([score, avg_trend, ema10, ema30, close, rsi, volume, vwap, atr, ema240, macd, macd_signal, rsi21, combined_signal],
+                              dtype=np.float32)
+    
+    # 포지션 정보 처리 (없으면 [0, 0, 0])
+    if position_info is None:
+        pos_vector = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+    else:
+        side = position_info.get("side", "none")
+        if side == "long":
+            side_val = 1.0
+        elif side == "short":
+            side_val = -1.0
+        else:
+            side_val = 0.0
+        unrealized_roi = position_info.get("unrealized_roi", 0.0)
+        position_age = float(position_info.get("position_age", 0.0))
+        pos_vector = np.array([side_val, unrealized_roi, position_age], dtype=np.float32)
+    
+    # 최종 상태 벡터: base_state (14차원) + pos_vector (3차원) = 17차원
+    state_vector = np.concatenate((base_state, pos_vector))
+    add_debug_log("StateVector", "생성", f"{symbol} 상태벡터 생성됨: {state_vector}")
+    return state_vector
+
+def validate_state_vector(state_vector):
+    if np.isnan(state_vector).any():
+        add_debug_log("Pretraining", "상태 벡터 오류", "NaN 값 포함됨 → 무시")
+        return False
+    if np.all(state_vector == 0):
+        add_debug_log("Pretraining", "상태 벡터 오류", "전부 0 값 → 무시")
+        return False
+    return True
+
+def calculate_score(df_segment):
+    if df_segment is None or df_segment.empty:
+        return 0
+    required_cols = ["close", "ema10", "bb_lower", "bb_upper", "rsi", "macd", "macd_signal"]
+    for col in required_cols:
+        if col not in df_segment.columns:
+            add_debug_log("Indicator", "score_calculation", f"필수 지표 {col} 누락", level="critical")
+            return 0
+    try:
+        last = df_segment.iloc[-1]
+        score = 5 if last["close"] > last["ema10"] else -5
+        if last["rsi"] < 30:
+            score += 5
+        elif last["rsi"] > 70:
+            score -= 5
+        if last["close"] <= last["bb_lower"]:
+            score += 3
+        elif last["close"] >= last["bb_upper"]:
+            score -= 3
+        score += 4 if last["macd"] > last["macd_signal"] else -4
+        return score
+    except Exception as e:
+        add_debug_log("Indicator", "score_calculation", f"오류 발생: {e}", level="critical")
+        return 0
+
+def get_realtime_price(symbol):
+    try:
+        endpoint = "/v5/market/tickers"
+        params = {"category": "linear", "symbol": symbol}
+        response = requests.get(BASE_URL + endpoint, params=params, timeout=5)
+        result = response.json()
+        if result["retCode"] == 0 and result["result"]["list"]:
+            price = float(result["result"]["list"][0]["lastPrice"])
+            add_debug_log("RealtimePrice", "조회", f"{symbol} 실시간 가격 조회: {price}", level="info")
+            return price
+        else:
+            add_debug_log("RealtimePrice", "API오류", f"{symbol} API 응답 이상: {result}", level="critical")
+            return 0.0
+    except Exception as e:
+        add_debug_log("RealtimePrice", "예외", f"{symbol} 가격 조회 오류: {e}", level="critical")
+        return 0.0
+
+def get_wallet_balance():
+    KEY_FILE = "Testmodekey.txt"
+    try:
+        with open(KEY_FILE, "r") as f:
+            api_key, api_secret = [line.strip() for line in f.readlines()]
+        from pybit.unified_trading import HTTP
+        session = HTTP(api_key=api_key, api_secret=api_secret)
+        response = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        balance = float(response["result"]["list"][0]["coin"][0]["equity"])
+        return balance
+    except Exception as e:
+        add_debug_log("WalletBalance", "예외", f"Wallet balance fetch error: {e}")
+        return 0.0
+
+def round_qty(symbol, qty):
+    try:
+        min_qty = SYMBOL_CONFIG[symbol]["min_qty"]
+        if float(min_qty).is_integer():
+            return int(round(qty))
+        else:
+            precision = len(str(min_qty).split('.')[1])
+            return round(qty, precision)
+    except Exception as e:
+        add_debug_log("OrderExecutor", "경고", f"Qty rounding 오류: {e}", level="critical")
+        return qty
+
+def map_action_to_api_side(action: str):
+    if action == "Long Entry":
+        return "Buy"
+    elif action == "Long Exit":
+        return "Sell"
+    elif action == "Short Entry":
+        return "Sell"
+    elif action == "Short Exit":
+        return "Buy"
+    else:
+        return None
+
+def calculate_order_qty(price, min_usdt=6.0):
+    """
+    최소 주문금액을 충족하기 위해 약간의 마진을 더해 수량을 계산합니다.
+    예: 2% 마진
+    """
+    qty = (min_usdt / price) * 1.05  # 5% 마진
+    return round(qty, 5)
+
+def execute_order_api(symbol, action, qty, reduce_only=False, retry_count=3):
+    for attempt in range(retry_count):
+        try:
+            side = map_action_to_api_side(action)
+            if side is None:
+                return {"retCode": -1, "message": "Hold action"}
+            final_qty = round_qty(symbol, qty)
+            body = {
+                "category": "linear",
+                "symbol": symbol,
+                "side": side,
+                "orderType": "Market",
+                "qty": str(final_qty),
+                "timeInForce": "GTC"
+            }
+            if reduce_only:
+                body["reduceOnly"] = True
+            KEY_FILE = "Testmodekey.txt"
+            with open(KEY_FILE, "r") as f:
+                api_key, api_secret = [line.strip() for line in f.readlines()]
+            from pybit.unified_trading import HTTP
+            session = HTTP(api_key=api_key, api_secret=api_secret)
+            data = session.place_order(**body)
+            if data.get("retCode") not in [0, "0"]:
+                add_debug_log("OrderAPI", "오류", f"Attempt {attempt+1}: {symbol} 주문 실패: {data}")
+                time.sleep(2)
+                continue
+            return {"retCode": 0, "result": data["result"]}
+        except Exception as e:
+            add_debug_log("OrderAPI", "예외", f"Attempt {attempt+1}: {symbol} 주문 예외: {e}")
+            time.sleep(2)
+    return {"retCode": -1, "message": "Order failed after retries"}
+
+def create_multitimeframe_sequences(symbol, window_size, feature_columns, data_func):
+    df = data_func(symbol, "5")
+    if df.empty or len(df) < window_size:
+        return None
+    seq = df[feature_columns].tail(window_size).values.astype(np.float32)
+    return np.expand_dims(seq, axis=0)
+
+_last_fng_update = 0
+_cached_fng = 50  # 기본값 중립
+
+# --- 심리 지표 (Fear & Greed Index) 함수 추가 ---
+def get_crypto_fear_greed_index():
+    try:
+        url = "https://api.alternative.me/fng/?limit=1&format=json"
+        response = requests.get(url, timeout=5)
+        data = response.json()
+        value = int(data["data"][0]["value"])
+        add_debug_log("FearGreed", "조회", f"Fear & Greed Index: {value}", level="info")
+        return value
+    except Exception as e:
+        add_debug_log("FearGreed", "오류", f"Fear & Greed Index 조회 실패: {e}", level="critical")
+        return 50
+
+def get_cached_fear_greed_index():
+    global _last_fng_update, _cached_fng
+    if time.time() - _last_fng_update > 60:
+        try:
+            _cached_fng = get_crypto_fear_greed_index()
+        except Exception as e:
+            add_debug_log("FearGreed", "오류", f"FNG 업데이트 실패: {e}", level="error")
+        _last_fng_update = time.time()
+    return _cached_fng

@@ -1,0 +1,605 @@
+1차 테스트  EMA 20, 260 
+**EMA 기반 추세 추종**:  
+  - EMA 10 > EMA 20 → 상승 추세  
+  - EMA 10 < EMA 30 → 하락 추세  
+- **물량 매집 조건**:  
+  - `오늘 거래량 > 10일 평균 거래량의 1.5배`  
+  - 이 경우 ‘매집 발생’으로 간주  
+- **진입 조건**:  
+  - **매수 (롱)**: EMA10 > EMA30 AND 매집 발생  
+  - **매도 (숏)**: EMA10 < EMA30 AND 매집 발생  
+- **청산 조건**:  
+  - 반대 EMA 교차 발생 시 포지션 종료
+
+2차 테스트 
+**볼린저밴드 기반 추세 추종**:  
+  - 볼린저밴드 10 > 볼린저밴드 30 → 상승 추세  
+  - 볼린저밴드 10 < 볼린저밴드 30 → 하락 추세  
+- **물량 매집 조건**:  
+  - `오늘 거래량 > 10일 평균 거래량의 1.5배`  
+  - 이 경우 ‘매집 발생’으로 간주  
+- **진입 조건**:  
+  - **매수 (롱)**: 볼린저밴드10 > 볼린저밴드30 AND 매집 발생  
+  - **매도 (숏)**: 볼린저밴드10 < 볼린저밴드30 AND 매집 발생  
+- **청산 조건**:  
+  - 반대 볼린저밴드 교차 발생 시 포지션 종료
+
+
+종목 솔라나 레버리지 1     백테스팅    
+
+
+import pandas as pd
+import time, math, random, threading, os, requests, datetime, pickle
+import numpy as np
+from pybit.unified_trading import HTTP
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # 경고를 무시하도록 설정
+import tensorflow as tf
+import logging
+
+BASE_URL = "https://api.bybit.com"
+logging.basicConfig(level=logging.INFO)
+
+# 1. API 키 파일 로드
+KEY_FILE = r"C:\Users\dirty\OneDrive\Desktop\Grid1\Grid1.txt"
+try:
+    with open(KEY_FILE, encoding='utf-8') as f:
+        api_key, api_secret = [line.strip() for line in f.readlines()]
+        print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ API 키 로드 성공")
+except Exception as e:
+    raise Exception(f"API 키 파일 읽기 실패: {e}")
+
+# 2. 세션 생성
+session = HTTP(api_key=api_key, api_secret=api_secret)
+print(f"[{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ API 세션 생성 완료")
+api_response = {
+    'retCode': 0,
+    'retMsg': 'OK',
+    'result': {'symbol': 'FARTCOINUSDT', 'category': 'linear', 'list': [['1740394860000', '0.3096', '0.3096', '0.3094', '0.3094', '10225', '3164.7755']]},
+    'retExtInfo': {},
+    'time': 1740394865005
+}
+
+if api_response['retCode'] != 0:
+    print(f"Error: {api_response['retMsg']}")
+else:
+    print("API call was successful, no error.")
+
+
+# 3. 전역 변수 설정
+symbol = "FARTCOINUSDT"  # 거래할 심볼
+order_size = 26  # 주문 수량 (24개)
+price_step = 0.001  # 그리드 간격 (0.001로 설정)
+price_history = []  # 가격 기록용 리스트
+leverage = 75  # 레버리지 설정
+ROI_THRESHOLD = 50      # ROI 청산 임계치 (%) ###
+position_mode = "HEDGE"  # 헤지 모드 활성화
+response = session.get_kline(symbol="FARTCOINUSDT", interval="1", limit=30)
+
+grid_update_event = threading.Event()
+
+# 4. 지갑 잔액 조회 함수 (get_wallet_balance)
+
+def get_wallet_balance():
+    try:
+        data = session.get_wallet_balance(accountType="UNIFIED", coin="USDT")
+        balance = float(data["result"]["list"][0]["coin"][0]["equity"])
+        print(f"현재 지갑 잔액: {balance} USDT")
+        return balance
+    except Exception as e:
+        print(f" ❌ 지갑 잔액 조회 실패: {str(e)}")
+        raise
+import requests
+
+# 5. 현재 가격 조회 함수 (get_price)
+def get_price():
+    """현재 가격 조회"""
+    try:
+        data = session.get_tickers(category="linear", symbol=symbol)
+        ticker = data["result"]["list"][0]
+        price = float(ticker["lastPrice"])
+        return price
+    except Exception as e:
+        print(f"❌ 가격 조회 실패: {e}")
+        return 0
+
+# 7. 열린 포지션 조회 함수 (개선됨)
+def get_open_positions():
+    try:
+        data = session.get_positions(category="linear", symbol=symbol)
+        positions = data.get("result", {}).get("list", [])
+        if not positions:
+            print("✅ 현재 열린 포지션이 없습니다.")
+        return positions
+    except Exception as e:
+        print(f"❌ 포지션 조회 중 오류 발생: {e}")
+        return []
+
+# 6. 진입가 조회 함수 (K2OnlineTrader.py의 get_position_entry_price() 참고)
+def get_position_entry_price(symbol):
+    try:
+        data = session.get_positions(category="linear", symbol=symbol)
+        if data.get("retCode") in [0, "0"] and "result" in data:
+            pos_list = data["result"].get("list", [])
+            if pos_list:
+                entry_price = float(pos_list[0].get("avgPrice") or pos_list[0].get("entryPrice") or 0)
+                return entry_price
+        return 0.0
+    except Exception as e:
+        print(f"Error retrieving entry price for {symbol}: {e}")
+        return 0.0
+
+# 7. ROI 계산 함수 (레버리지 반영)
+def calculate_roi_with_leverage(entry_price, current_price, side="buy", leverage=1):
+    if entry_price == 0 or leverage <= 0:
+        return 0
+    margin = entry_price / leverage
+    # 롱인 경우: profit = current_price - entry_price, 숏인 경우: profit = entry_price - current_price
+    if side.lower() in ["buy", "long"]:
+        profit = current_price - entry_price
+    else:  # short
+        profit = entry_price - current_price
+    return (profit / margin) * 100
+
+def get_candle_data_v5(symbol, intervals='1', limit=30):
+    endpoint = "/v5/market/kline"
+    symbol = "FARTCOINUSDT"  # 거래할 심볼
+    params = {"category": "linear", "symbol": symbol, "interval": intervals, "limit": limit}
+    try:
+        resp = requests.get(BASE_URL + endpoint, params=params, timeout=10)
+        data = resp.json()
+        if data.get("retCode") not in [0, "0"]:
+            print("Failed to fetch candlestick data.")
+            return pd.DataFrame()
+        kline_list = data["result"]["list"]
+        columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+        df = pd.DataFrame(kline_list, columns=columns)
+        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors='coerce'), unit="ms")
+        df.set_index("timestamp", inplace=True)
+        return df
+    except Exception as e:
+        print(f"Error: {e}")
+        return pd.DataFrame()
+
+def fetch_data_with_retry(symbol, interval='1', limit=30, retries=5):
+    
+    for i in range(retries):
+        try:
+            candlesticks = get_candle_data_v5(symbol, interval, limit)
+            
+            if isinstance(candlesticks, pd.DataFrame) and not candlesticks.empty:
+                return candlesticks
+            
+            logging.warning(f"[{symbol}] No data received. Retrying... Attempt {i + 1}/{retries}")
+        
+        except Exception as e:
+            logging.error(f"[{symbol}] Error fetching data: {e}. Retrying... Attempt {i + 1}/{retries}")
+
+        time.sleep(1)  # 1초 대기 후 재시도
+
+    logging.error(f"[{symbol}] Failed to fetch data after {retries} attempts.")
+    return pd.DataFrame()
+
+def get_candle_data_v5(symbol, interval='5', limit=30):
+    endpoint = "/v5/market/kline"
+    symbol = "FARTCOINUSDT"  # 거래할 심볼
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        resp = requests.get(BASE_URL + endpoint, params=params, timeout=10)
+        data = resp.json()
+        if data.get("retCode") not in [0, "0"]:
+            print("Failed to fetch candlestick data.")
+            return pd.DataFrame()
+        kline_list = data["result"]["list"]
+        columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+        df = pd.DataFrame(kline_list, columns=columns)
+        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors='coerce'), unit="ms")
+        df.set_index("timestamp", inplace=True)
+        return df
+    except Exception as e:
+        print(f"Error: {e}")
+        return pd.DataFrame()
+
+def fetch_data_with_retry(symbol, interval='5', limit=30, retries=5):
+    
+    for i in range(retries):
+        try:
+            candlesticks_5m = get_candle_data_v5(symbol, interval, limit)
+            
+            if isinstance(candlesticks_5m, pd.DataFrame) and not candlesticks_5m.empty:
+                return candlesticks_5m
+            
+            logging.warning(f"[{symbol}] No data received. Retrying... Attempt {i + 1}/{retries}")
+        
+        except Exception as e:
+            logging.error(f"[{symbol}] Error fetching data: {e}. Retrying... Attempt {i + 1}/{retries}")
+
+        time.sleep(1)  # 1초 대기 후 재시도
+
+    logging.error(f"[{symbol}] Failed to fetch data after {retries} attempts.")
+    return pd.DataFrame()
+def get_candle_data_v5(symbol, interval='15', limit=30):
+    endpoint = "/v5/market/kline"
+    symbol = "FARTCOINUSDT"  # 거래할 심볼
+    params = {"category": "linear", "symbol": symbol, "interval": interval, "limit": limit}
+    try:
+        resp = requests.get(BASE_URL + endpoint, params=params, timeout=10)
+        data = resp.json()
+        if data.get("retCode") not in [0, "0"]:
+            print("Failed to fetch candlestick data.")
+            return pd.DataFrame()
+        kline_list = data["result"]["list"]
+        columns = ["timestamp", "open", "high", "low", "close", "volume", "turnover"]
+        df = pd.DataFrame(kline_list, columns=columns)
+        df["timestamp"] = pd.to_datetime(pd.to_numeric(df["timestamp"], errors='coerce'), unit="ms")
+        df.set_index("timestamp", inplace=True)
+        return df
+    except Exception as e:
+        print(f"Error: {e}")
+        return pd.DataFrame()
+
+def fetch_data_with_retry(symbol, interval='15', limit=30, retries=5):
+    
+    for i in range(retries):
+        try:
+            candlesticks_15m = get_candle_data_v5(symbol, interval, limit)
+            
+            if isinstance(candlesticks_15m, pd.DataFrame) and not candlesticks_15m.empty:
+                return candlesticks_15m
+            
+            logging.warning(f"[{symbol}] No data received. Retrying... Attempt {i + 1}/{retries}")
+        
+        except Exception as e:
+            logging.error(f"[{symbol}] Error fetching data: {e}. Retrying... Attempt {i + 1}/{retries}")
+
+        time.sleep(1)  # 1초 대기 후 재시도
+
+    logging.error(f"[{symbol}] Failed to fetch data after {retries} attempts.")
+    return pd.DataFrame()
+
+def calculate_bollinger_bands(candlesticks):
+    try:
+        close_prices = []
+        
+        # candlesticks가 DataFrame인 경우 빈 DataFrame인지 확인
+        if candlesticks.empty:
+            raise ValueError("Candlestick data is empty.")
+        
+        # candlesticks가 비어 있지 않으면, 각 candle에서 가격을 추출
+        for _, candle in candlesticks.iterrows():
+            try:
+                close_prices.append(float(candle['close']))  # 'close' 가격을 추출
+            except ValueError:
+                print(f"Invalid close price value: {candle['close']}")
+        
+        if len(close_prices) < 1:
+            raise ValueError("No valid close prices found.")
+
+
+        
+        # Bollinger Bands 계산 (예시)
+        window = 30
+        rolling_mean = sum(close_prices[-window:]) / window
+        rolling_std = (sum((x - rolling_mean) ** 2 for x in close_prices[-window:]) / window) ** 0.5
+        
+        upper_band = rolling_mean + (2 * rolling_std)
+        lower_band = rolling_mean - (2 * rolling_std)
+        
+        return upper_band, lower_band
+
+    except Exception as e:
+        print(f"Error in calculate_bollinger_bands: {e}")
+        raise e
+def calculate_bollinger_bands(candlesticks_5m):
+    try:
+        close_prices_5m = []
+        
+        # candlesticks가 DataFrame인 경우 빈 DataFrame인지 확인
+        if candlesticks_5m.empty:
+            raise ValueError("Candlestick data is empty.")
+        
+        # candlesticks가 비어 있지 않으면, 각 candle에서 가격을 추출
+        for _, candle_5m in candlesticks_5m.iterrows():
+            try:
+                close_prices_5m.append(float(candle_5m['close']))  # 'close' 가격을 추출
+            except ValueError:
+                print(f"Invalid close price value: {candle_5m['close']}")
+        
+        if len(close_prices_5m) < 5:
+            raise ValueError("No valid close prices found.")
+        
+        # Bollinger Bands 계산 (예시)
+        window = 30
+        rolling_mean = sum(close_prices_5m[-window:]) / window
+        rolling_std = (sum((x - rolling_mean) ** 2 for x in close_prices_5m[-window:]) / window) ** 0.5
+        
+        upper_band_5m = rolling_mean + (2 * rolling_std)
+        lower_band_5m = rolling_mean - (2 * rolling_std)
+        
+        return upper_band_5m, lower_band_5m
+
+    except Exception as e:
+        print(f"Error in calculate_bollinger_bands: {e}")
+        raise e
+    
+def calculate_bollinger_bands(candlesticks_15m):
+    try:
+        close_prices_15m = []
+        
+        # candlesticks가 DataFrame인 경우 빈 DataFrame인지 확인
+        if candlesticks_15m.empty:
+            raise ValueError("Candlestick data is empty.")
+        
+        # candlesticks가 비어 있지 않으면, 각 candle에서 가격을 추출
+        for _, candle_15m in candlesticks_15m.iterrows():
+            try:
+                close_prices_15m.append(float(candle_15m['close']))  # 'close' 가격을 추출
+            except ValueError:
+                print(f"Invalid close price value: {candle_15m['close']}")
+        
+        if len(close_prices_15m) < 15:
+            raise ValueError("No valid close prices found.")
+        
+        # Bollinger Bands 계산 (예시)
+        window = 30
+        rolling_mean = sum(close_prices_15m[-window:]) / window
+        rolling_std = (sum((x - rolling_mean) ** 2 for x in close_prices_15m[-window:]) / window) ** 0.5
+        
+        upper_band_15m = rolling_mean + (2 * rolling_std)
+        lower_band_15m = rolling_mean - (2 * rolling_std)
+        
+        return upper_band_15m, lower_band_15m
+
+    except Exception as e:
+        print(f"Error in calculate_bollinger_bands: {e}")
+        raise e
+    
+def cancel_single_order(symbol, order_id):
+    """단일 주문을 취소하는 함수 (동시 실행용)"""
+    try:
+        cancel_response = session.cancel_order(
+            category="linear",
+            symbol=symbol,
+            orderId=order_id
+        )
+        print(f"🚀 주문 취소 완료: {order_id} - 응답: {cancel_response}")
+    except Exception as e:
+        print(f"❌ 주문 취소 중 오류 발생: {e}")
+
+def cancel_pending_orders(symbol, position_idx=None, retry_count=5):
+    """미체결 주문을 동시에 취소 (재시도 로직 포함)"""
+    try:
+        print(f"📅 미체결 주문 취소 요청: {symbol} (포지션: {position_idx or '전체'})")
+
+        for attempt in range(retry_count):
+            params = {"category": "linear", "symbol": symbol}
+            if position_idx is not None:
+                params["positionIdx"] = position_idx
+
+            response = session.get_open_orders(**params)
+
+            if "result" in response and "list" in response["result"]:
+                open_orders = response["result"]["list"]
+
+                if not open_orders:
+                    print(f"✅ 미체결 주문이 없습니다: {symbol}")
+                    return
+
+                # 주문 개별 취소
+                threads = []
+                for order in open_orders:
+                    order_id = order["orderId"]
+                    thread = threading.Thread(target=cancel_single_order, args=(symbol, order_id))
+                    threads.append(thread)
+                    thread.start()
+
+                # 스레드 종료 대기
+                for thread in threads:
+                    thread.join()
+
+                print(f"✅ 주문 취소 완료! (시도 {attempt + 1}/{retry_count})")
+
+                # 3초 대기 후 재확인
+                time.sleep(3)
+            else:
+                print(f"⚠️ 미체결 주문 조회 실패: {response}")
+                break
+
+        # 최종적으로 미체결 주문 확인
+        remaining_orders = get_open_orders(symbol)
+        if remaining_orders:
+            print(f"⚠️ {len(remaining_orders)}개의 미체결 주문이 여전히 남아 있습니다. 추가 취소 필요!")
+        else:
+            print(f"✅ 모든 미체결 주문이 취소되었습니다!")
+
+    except Exception as e:
+        print(f"❌ 미체결 주문 취소 중 오류 발생: {e}")
+    time.sleep(300)
+
+def close_position(symbol, side, qty, position_idx):
+    """
+    Bybit에서 포지션을 종료하는 함수 (헤지 모드 전용).
+    side: 롱 청산이면 "Sell", 숏 청산이면 "Buy"
+    position_idx: 롱=1, 숏=2
+    """
+    try:
+        order = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=side,
+            orderType="Market",
+            qty=str(qty),
+            positionIdx=position_idx,  # ★ positionIdx 꼭 지정
+            timeInForce="GoodTillCancel"
+        )
+        if order.get("retCode") == 0:
+            print(f"✅ 포지션 종료 성공: {side} {qty} {symbol} (idx={position_idx})")
+            return order
+        else:
+            print(f"❌ 포지션 종료 실패: {order}")
+            return None
+    except Exception as e:
+        print(f"🚨 포지션 종료 오류: {e}")
+        return None
+
+# 8. ROI 기반 청산 로직 (롱/숏 별도 계산)
+def check_and_close_positions_by_roi(threshold=50):
+    positions = get_open_positions()
+    if not positions:
+        return
+
+    current_price = get_price()
+    print(f"[LIQUIDATION] 현재 가격: {current_price}")
+
+    for pos in positions:
+        pos_side = pos.get("side", "").lower().strip()
+        pos_idx  = pos.get("positionIdx", 0)
+        qty      = float(pos.get("size", 0))
+        entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0)
+
+        if qty <= 0 or not pos_side:
+            continue
+
+        side_for_roi = "long" if pos_side == "buy" else "short"
+        roi = calculate_roi_with_leverage(entry_price, current_price, side=side_for_roi, leverage=leverage)
+
+        print(f"[LIQUIDATION] {pos_side.upper()} 포지션: idx={pos_idx}, qty={qty}, entry={entry_price}, ROI={roi:.2f}%")
+
+        if roi >= threshold:
+            liquidation_side = "Sell" if pos_side == "buy" else "Buy"
+            liquidation_idx  = 1 if pos_side == "buy" else 2
+
+            print(f"[LIQUIDATION] ROI {roi:.2f}% >= {threshold}% → 청산 시도")
+            close_position(symbol, liquidation_side, qty, liquidation_idx)
+
+            # ✅ **청산 후 즉시 그리드 재배치 트리거**
+            grid_update_event.set()
+
+        else:
+            print(f"[LIQUIDATION] ROI {roi:.2f}% < {threshold}% → 유지")
+                
+def print_order_summary(order_type, price_range, total_qty):
+    """주문 요약 정보 출력"""
+    print(f"✅ 전체 {order_type} 주문 배치 완료! 총 {total_qty}개 주문")
+    print(f"📊 {order_type} 주문 가격 범위: {price_range[0]:.3f} ~ {price_range[1]:.3f}")
+    print(f"📉 전체 {order_type} 주문 수량: {total_qty}\n")
+
+# 📌 미체결 주문 확인 함수 추가
+def get_open_orders(symbol):
+    """미체결 주문 조회"""
+    try:
+        response = session.get_open_orders(category="linear", symbol=symbol)
+        if "result" in response and "list" in response["result"]:
+            return response["result"]["list"]
+        return []
+    except Exception as e:
+        print(f"🚨 미체결 주문 조회 오류: {e}")
+        return []
+
+# 10. 디버깅: 현재 포지션 ROI 출력 함수
+def debug_print_positions_roi():
+    positions = get_open_positions()
+    if not positions:
+        print("[DEBUG] 현재 열린 포지션이 없습니다.")
+        return
+    
+    current_price = get_price()
+    print(f"[DEBUG] 현재 가격: {current_price}")
+    
+    for pos in positions:
+        pos_side = pos.get("side", "").lower().strip()  # "buy"/"sell"
+        pos_idx  = pos.get("positionIdx", 0)
+        qty      = float(pos.get("size", 0))
+
+        # avgPrice → entryPrice 순서로 가져오기
+        entry_price = float(pos.get("avgPrice") or pos.get("entryPrice") or 0.0)
+        
+        # side/qty가 유효하지 않으면 스킵
+        if not pos_side or qty <= 0:
+            continue
+        
+        # 한글 표기
+        side_str = "롱" if pos_side == "buy" else "숏"
+        
+        # ROI 계산용
+        side_for_roi = "long" if pos_side == "buy" else "short"
+        roi = calculate_roi_with_leverage(entry_price, current_price, side=side_for_roi, leverage=leverage)
+        
+        print(f"[DEBUG] 포지션: {side_str} | idx={pos_idx} | 진입가: {entry_price} | 수량: {qty} | ROI: {roi:.2f}%")
+
+# 10. 1.5초 간격으로 ROI 정보를 출력하는 함수 (데몬 스레드로 실행)
+def continuously_print_roi(interval=1.5):
+    while True:
+        debug_print_positions_roi()
+        time.sleep(interval)
+
+def execute_limit_order(symbol, side, price, qty, position_idx):
+    """
+    Bybit에 지정가 주문을 실행하는 함수
+    
+    :param symbol: 거래 심볼 (예: "FARTCOINUSDT")
+    :param side: 주문 방향 ("Buy" 또는 "Sell")
+    :param price: 주문 가격
+    :param qty: 주문 수량
+    :param position_idx: 포지션 인덱스 (1=롱, 2=숏)
+    :return: 주문 응답 데이터
+    """
+    try:
+        order = session.place_order(
+            category="linear",
+            symbol=symbol,
+            side=side,
+            orderType="Limit",
+            qty=str(qty),  # Bybit API에서 문자열로 받는 경우 대비
+            price=str(price),
+            timeInForce="GTC",  # 주문이 체결될 때까지 유지
+            positionIdx=position_idx  # 1=Long, 2=Short
+        )
+        if order.get("retCode") == 0:
+            print(f"✅ 지정가 주문 성공: {side} {qty} {symbol} @ {price} (포지션: {position_idx})")
+        
+            
+            return order
+        else:
+            print(f"❌ 지정가 주문 실패: {order}")
+            return None
+
+    except Exception as e:
+        print(f"🚨 주문 실행 오류: {e}")
+        return None
+
+def main():
+    """메인 실행 함수: 주문 진입(그리드 주문 관리)와 ROI 청산을 동시에 실행합니다."""
+    order_thread = threading.Thread(target=manage_orders, daemon=True)
+    order_thread.start()
+
+    print("🚀 ROI 및 청산 모니터링 프로그램 시작")
+    try:
+        while True:
+            check_and_close_positions_by_roi(threshold=ROI_THRESHOLD)
+            grid_update_event.wait(timeout=300)  # 5분 대기 또는 청산 발생 시 즉시 실행
+            grid_update_event.clear()
+    except KeyboardInterrupt:
+        print("\n🛑 프로그램이 수동으로 종료되었습니다.")
+
+# --- 메인 실행 ---
+if __name__ == "__main__":
+    # ROI 디버깅 출력 데몬 스레드 시작 (1.5초 간격)
+    roi_debug_thread = threading.Thread(target=continuously_print_roi, daemon=True)
+    roi_debug_thread.start()
+    
+    # ROI 기반 청산 로직 스레드 시작 (10초마다 실행)
+    def liquidation_loop():
+        while True:
+            check_and_close_positions_by_roi(threshold=ROI_THRESHOLD)
+            time.sleep(10)
+    liquidation_thread = threading.Thread(target=liquidation_loop, daemon=True)
+    liquidation_thread.start()
+    
+    # 주문 진입(그리드 주문 관리) 스레드 시작
+    order_thread = threading.Thread(target=manage_orders, daemon=True)
+    order_thread.start()
+    
+    print("🚀 프로그램 시작 - 모든 스레드 실행 중...")
+    while True:
+        time.sleep(1)

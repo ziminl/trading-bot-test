@@ -1,0 +1,20 @@
+# config.py
+
+# 심볼별 설정 (레버리지, 최소 주문 수량 등)
+SYMBOL_CONFIG = {
+    "AI16ZUSDT": {"leverage": 75, "min_qty": 100}
+}
+
+# 공통 하이퍼파라미터
+INITIAL_LEARNING_RATE = 1e-3
+GAMMA = 0.98
+BATCH_SIZE = 256
+NUM_ITERATIONS = 30000
+PATIENCE = 10000
+DEFAULT_MARKET_REGIME = "neutral"
+
+# 글로벌 상수 (초 단위)
+STRATEGY_COOLDOWN = 60      # 전략 쿨다운(초)
+LOSS_COOLDOWN = 300         # 손실 쿨다운(초)
+MIN_HOLD_TIME = 300         # 최소 홀딩 시간(초)
+LSTM_WINDOW_SIZE = 10       # LSTM 윈도우 사이즈

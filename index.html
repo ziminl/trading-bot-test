@@ -1,0 +1,549 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>암호화폐 백테스트 (정적 버전)</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body {
+      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      margin: 0;
+      padding: 20px;
+      background-color: #f5f5f5;
+    }
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+      background-color: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+    }
+    header {
+      text-align: center;
+      margin-bottom: 30px;
+    }
+    h1 {
+      color: #333;
+      margin-bottom: 5px;
+    }
+    .summary {
+      display: flex;
+      justify-content: space-around;
+      margin-bottom: 30px;
+      flex-wrap: wrap;
+    }
+    .summary-card {
+      background-color: #f8f9fa;
+      border-radius: 6px;
+      padding: 15px;
+      min-width: 200px;
+      margin: 10px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
+      text-align: center;
+    }
+    .summary-card h3 {
+      margin-top: 0;
+      color: #555;
+    }
+    .summary-card .value {
+      font-size: 24px;
+      font-weight: bold;
+      color: #333;
+    }
+    .chart-container {
+      position: relative;
+      height: 400px;
+      margin-bottom: 30px;
+    }
+    .trades-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 20px;
+    }
+    .trades-table th, .trades-table td {
+      padding: 12px 15px;
+      text-align: left;
+      border-bottom: 1px solid #ddd;
+    }
+    .trades-table th {
+      background-color: #f8f9fa;
+      font-weight: 600;
+    }
+    .buy {
+      color: #28a745;
+    }
+    .sell {
+      color: #dc3545;
+    }
+    .loading {
+      text-align: center;
+      padding: 50px;
+      font-size: 18px;
+      color: #666;
+    }
+    .loading-spinner {
+      border: 4px solid #f3f3f3;
+      border-radius: 50%;
+      border-top: 4px solid #3498db;
+      width: 40px;
+      height: 40px;
+      margin: 20px auto;
+      animation: spin 1s linear infinite;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .tab-container {
+      margin-bottom: 20px;
+    }
+    .tab-buttons {
+      display: flex;
+      border-bottom: 1px solid #ddd;
+    }
+    .tab-button {
+      padding: 10px 20px;
+      background: none;
+      border: none;
+      cursor: pointer;
+      font-size: 16px;
+      outline: none;
+    }
+    .tab-button.active {
+      border-bottom: 2px solid #4a90e2;
+      color: #4a90e2;
+    }
+    .tab-content {
+      display: none;
+    }
+    .tab-content.active {
+      display: block;
+    }
+    .error-message {
+      text-align: center;
+      padding: 20px;
+      background-color: #fff0f0;
+      border-radius: 6px;
+      color: #d32f2f;
+      margin: 20px 0;
+    }
+    .retry-button {
+      display: block;
+      margin: 20px auto;
+      padding: 10px 15px;
+      background-color: #4a90e2;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+      font-size: 16px;
+    }
+    .retry-button:hover {
+      background-color: #3a7ac8;
+    }
+    .note {
+      font-size: 14px;
+      color: #666;
+      margin-top: 50px;
+      text-align: center;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>이더리움 SMA 크로스오버 전략 백테스트</h1>
+      <p>단기 SMA(10일)와 장기 SMA(50일)의 크로스오버를 기반으로 한 백테스트 결과</p>
+    </header>
+
+    <div id="loading" class="loading">
+      <p>데이터를 로딩 중입니다...</p>
+      <div class="loading-spinner"></div>
+    </div>
+
+    <div id="error-container" style="display: none;" class="error-message">
+      <h3>오류가 발생했습니다</h3>
+      <p id="error-message">데이터를 불러오는 중 문제가 발생했습니다.</p>
+      <button class="retry-button" onclick="loadMockData()">다시 시도</button>
+    </div>
+
+    <div id="content" style="display: none;">
+      <div class="summary">
+        <div class="summary-card">
+          <h3>시작 잔액</h3>
+          <div class="value">$1,000.00</div>
+        </div>
+        <div class="summary-card">
+          <h3>최종 잔액</h3>
+          <div id="final-balance" class="value">$0.00</div>
+        </div>
+        <div class="summary-card">
+          <h3>수익률</h3>
+          <div id="profit-percentage" class="value">0%</div>
+        </div>
+        <div class="summary-card">
+          <h3>총 거래 횟수</h3>
+          <div id="total-trades" class="value">0</div>
+        </div>
+      </div>
+
+      <div class="tab-container">
+        <div class="tab-buttons">
+          <button class="tab-button active" onclick="openTab('price-chart-tab')">가격 차트</button>
+          <button class="tab-button" onclick="openTab('balance-chart-tab')">잔액 차트</button>
+          <button class="tab-button" onclick="openTab('trades-tab')">거래 내역</button>
+        </div>
+        
+        <div id="price-chart-tab" class="tab-content active">
+          <div class="chart-container">
+            <canvas id="priceChart"></canvas>
+          </div>
+        </div>
+        
+        <div id="balance-chart-tab" class="tab-content">
+          <div class="chart-container">
+            <canvas id="balanceChart"></canvas>
+          </div>
+        </div>
+        
+        <div id="trades-tab" class="tab-content">
+          <table class="trades-table">
+            <thead>
+              <tr>
+                <th>유형</th>
+                <th>날짜</th>
+                <th>가격</th>
+                <th>잔액</th>
+              </tr>
+            </thead>
+            <tbody id="trades-body"></tbody>
+          </table>
+        </div>
+      </div>
+      
+      <div class="note">
+        <p>이 파일은 미리 계산된 데이터를 사용한 정적 버전입니다. 실시간 데이터를 보려면 웹 서버를 실행하세요.</p>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let priceChart, balanceChart;
+    
+    // 페이지 로드 시 백테스트 실행
+    window.addEventListener('DOMContentLoaded', () => {
+      loadMockData();
+    });
+    
+    // 미리 계산된 백테스트 데이터 로드 (로컬 버전용)
+    function loadMockData() {
+      // 화면 초기화
+      document.getElementById('loading').style.display = 'block';
+      document.getElementById('content').style.display = 'none';
+      document.getElementById('error-container').style.display = 'none';
+      
+      // 데이터 로딩 시뮬레이션 (실제로는 미리 계산된 결과를 사용)
+      setTimeout(() => {
+        try {
+          const data = getMockBacktestData();
+          
+          // 로딩 숨기고 콘텐츠 표시
+          document.getElementById('loading').style.display = 'none';
+          document.getElementById('content').style.display = 'block';
+          
+          renderSummary(data);
+          renderCharts(data);
+          renderTrades(data.trades);
+        } catch (error) {
+          console.error('Error:', error);
+          document.getElementById('loading').style.display = 'none';
+          document.getElementById('error-container').style.display = 'block';
+          document.getElementById('error-message').textContent = `데이터를 로드하는 중 오류가 발생했습니다: ${error.message}`;
+        }
+      }, 1000); // 1초 로딩 딜레이 (시뮬레이션)
+    }
+    
+    // 미리 계산된 백테스트 결과
+    function getMockBacktestData() {
+      // 여기에 미리 계산된 백테스트 결과가 들어갑니다.
+      // 실제 백테스트 실행 결과 예시
+      const dates = generateDates(365);
+      const prices = generatePrices();
+      const shortSMA = calculateSimpleSMA(prices, 10);
+      const longSMA = calculateSimpleSMA(prices, 50);
+      
+      // 백테스트 로직 실행
+      const { trades, balanceHistory, finalBalance } = runBacktest(dates, prices, shortSMA, longSMA);
+      
+      return {
+        trades: trades,
+        finalBalance: finalBalance,
+        chartData: {
+          dates: dates,
+          prices: prices,
+          shortSMA: shortSMA,
+          longSMA: longSMA
+        },
+        balanceHistory: balanceHistory
+      };
+    }
+    
+    // 날짜 생성 함수
+    function generateDates(count = 365) {
+  const dates = [];
+  const startDate = new Date('2020-01-01');
+  for (let i = 0; i < count; i++) {
+    const date = new Date(startDate);
+    date.setDate(startDate.getDate() + i);
+    dates.push(date.toISOString().split('T')[0]);
+  }
+  return dates;
+}
+
+    // 가격 데이터 생성 함수 (시뮬레이션)
+    function generatePrices() {
+      const prices = [];
+      let price = 2500; // 시작 가격
+      
+      for (let i = 0; i < 365; i++) {
+        // 랜덤 변동 (-3% ~ +3%)
+        const change = price * (Math.random() * 0.06 - 0.03);
+        price += change;
+        prices.push(price);
+      }
+      
+      return prices;
+    }
+    
+    // 단순 이동평균 계산 함수
+    function calculateSimpleSMA(data, period) {
+      const result = [];
+      
+      // 초기 구간에는 SMA 계산 불가
+      for (let i = 0; i < period - 1; i++) {
+        result.push(null);
+      }
+      
+      // 이후 구간에 대해서 SMA 계산
+      for (let i = period - 1; i < data.length; i++) {
+        let sum = 0;
+        for (let j = 0; j < period; j++) {
+          sum += data[i - j];
+        }
+        result.push(sum / period);
+      }
+      
+      return result;
+    }
+    
+    // 백테스트 실행 함수
+    function runBacktest(dates, prices, shortSMA, longSMA) {
+      let position = 0; // 0: no position, 1: long position
+      let balance = 1000; // starting with $1000
+      let entryPrice = 0;
+      
+      const trades = [];
+      const balanceHistory = [{ date: dates[0], balance: balance }];
+      
+      for (let i = 50; i < prices.length; i++) {
+        if (shortSMA[i] > longSMA[i] && position === 0) {
+          // 매수 신호
+          position = 1;
+          entryPrice = prices[i];
+          trades.push({
+            type: 'buy',
+            price: entryPrice,
+            date: dates[i],
+            balance: balance
+          });
+        } else if (shortSMA[i] < longSMA[i] && position === 1) {
+          // 매도 신호
+          position = 0;
+          const exitPrice = prices[i];
+          const profit = (exitPrice - entryPrice) / entryPrice * balance;
+          balance += profit;
+          trades.push({
+            type: 'sell',
+            price: exitPrice,
+            date: dates[i],
+            balance: balance
+          });
+        }
+        
+        balanceHistory.push({ date: dates[i], balance: balance });
+      }
+      
+      return {
+        trades,
+        balanceHistory,
+        finalBalance: balance
+      };
+    }
+    
+    // 요약 정보 렌더링
+    function renderSummary(data) {
+      const finalBalance = data.finalBalance;
+      const profitPercentage = ((finalBalance - 1000) / 1000 * 100).toFixed(2);
+      const totalTrades = data.trades.length;
+      
+      document.getElementById('final-balance').textContent = `$${finalBalance.toFixed(2)}`;
+      document.getElementById('profit-percentage').textContent = `${profitPercentage}%`;
+      document.getElementById('total-trades').textContent = totalTrades;
+    }
+    
+    // 차트 렌더링
+    function renderCharts(data) {
+      // 기존 차트 제거
+      if (priceChart) {
+        priceChart.destroy();
+      }
+      if (balanceChart) {
+        balanceChart.destroy();
+      }
+      
+      // 가격 차트
+      const priceCtx = document.getElementById('priceChart').getContext('2d');
+      priceChart = new Chart(priceCtx, {
+        type: 'line',
+        data: {
+          labels: data.chartData.dates.slice(50), // 50일부터 시작
+          datasets: [
+            {
+              label: '이더리움 가격',
+              data: data.chartData.prices.slice(50),
+              borderColor: 'rgba(75, 192, 192, 1)',
+              backgroundColor: 'rgba(75, 192, 192, 0.1)',
+              borderWidth: 2,
+              fill: false,
+              tension: 0.1
+            },
+            {
+              label: '10일 SMA',
+              data: data.chartData.shortSMA.slice(50),
+              borderColor: 'rgba(54, 162, 235, 1)',
+              borderWidth: 1.5,
+              fill: false,
+              tension: 0.1
+            },
+            {
+              label: '50일 SMA',
+              data: data.chartData.longSMA.slice(50),
+              borderColor: 'rgba(255, 99, 132, 1)',
+              borderWidth: 1.5,
+              fill: false,
+              tension: 0.1
+            }
+          ]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: {
+              beginAtZero: false
+            }
+          }
+        }
+      });
+      
+      // 잔액 차트
+      const balanceCtx = document.getElementById('balanceChart').getContext('2d');
+      const balanceData = data.balanceHistory.slice(50);
+      
+      balanceChart = new Chart(balanceCtx, {
+        type: 'line',
+        data: {
+          labels: balanceData.map(item => item.date),
+          datasets: [{
+            label: '계좌 잔액',
+            data: balanceData.map(item => item.balance),
+            borderColor: 'rgba(255, 159, 64, 1)',
+            backgroundColor: 'rgba(255, 159, 64, 0.1)',
+            borderWidth: 2,
+            fill: true,
+            tension: 0.1
+          }]
+        },
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          scales: {
+            y: {
+              beginAtZero: false
+            }
+          }
+        }
+      });
+    }
+    
+    // 거래 내역 렌더링
+    function renderTrades(trades) {
+      const tradesBody = document.getElementById('trades-body');
+      tradesBody.innerHTML = '';
+      
+      if (trades.length === 0) {
+        const row = document.createElement('tr');
+        const cell = document.createElement('td');
+        cell.colSpan = 4;
+        cell.textContent = '거래 내역이 없습니다.';
+        cell.style.textAlign = 'center';
+        row.appendChild(cell);
+        tradesBody.appendChild(row);
+        return;
+      }
+      
+      trades.forEach(trade => {
+        const row = document.createElement('tr');
+        
+        // 거래 유형
+        const typeCell = document.createElement('td');
+        const typeText = trade.type === 'buy' ? '매수' : '매도';
+        typeCell.textContent = typeText;
+        typeCell.className = trade.type;
+        row.appendChild(typeCell);
+        
+        // 날짜
+        const dateCell = document.createElement('td');
+        dateCell.textContent = trade.date;
+        row.appendChild(dateCell);
+        
+        // 가격
+        const priceCell = document.createElement('td');
+        priceCell.textContent = `$${trade.price.toFixed(2)}`;
+        row.appendChild(priceCell);
+        
+        // 잔액
+        const balanceCell = document.createElement('td');
+        balanceCell.textContent = `$${trade.balance.toFixed(2)}`;
+        row.appendChild(balanceCell);
+        
+        tradesBody.appendChild(row);
+      });
+    }
+    
+    // 탭 기능
+    function openTab(tabId) {
+      // 모든 탭 내용 숨기기
+      const tabContents = document.getElementsByClassName('tab-content');
+      for (let i = 0; i < tabContents.length; i++) {
+        tabContents[i].classList.remove('active');
+      }
+      
+      // 모든 탭 버튼 비활성화
+      const tabButtons = document.getElementsByClassName('tab-button');
+      for (let i = 0; i < tabButtons.length; i++) {
+        tabButtons[i].classList.remove('active');
+      }
+      
+      // 선택한 탭만 보이게
+      document.getElementById(tabId).classList.add('active');
+      
+      // 선택한 탭 버튼 활성화
+      const activeTabIndex = Array.from(document.getElementsByClassName('tab-content')).findIndex(element => element.id === tabId);
+      tabButtons[activeTabIndex].classList.add('active');
+    }
+  </script>
+</body>
+</html> 

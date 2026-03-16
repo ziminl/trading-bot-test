@@ -1,0 +1,52 @@
+import numpy as np
+from UtilityModule import add_debug_log, calculate_score, get_cached_fear_greed_index
+
+ALT_SIGNAL_MEMORY = {}
+LSTM_SIGNAL_MEMORY = {}
+
+def generate_state_vector_from_df(df, idx, lstm_model=None, symbol=None):
+    if idx == 0:
+        prev = df.iloc[idx]
+    else:
+        prev = df.iloc[idx-1]
+    last = df.iloc[idx]
+
+    avg_trend = ((last["close"] - prev["close"]) / prev["close"]) * 100
+    score = calculate_score(df.iloc[:idx+1])
+    ema10 = last["ema10"]
+    ema30 = last["ema30"]
+    close = last["close"]
+    rsi = last["rsi"]
+    volume = last["volume"]
+    atr = last["atr"]
+    vwap = last["vwap"]
+    ema240 = df["close"].ewm(span=240, adjust=False).mean().iloc[idx] if idx >= 240 else ema30
+    macd = last["macd"]
+    macd_signal = last["macd_signal"]
+    rsi21 = df["rsi"].rolling(window=21).mean().iloc[idx] if idx >= 21 else rsi
+
+    volatility = df["close"].pct_change().rolling(window=14).std().iloc[idx] * 100 if idx >= 14 else df["close"].pct_change().std() * 100
+    fear_greed = get_cached_fear_greed_index()
+
+    combined_signal = (score + avg_trend + volatility * 0.5 + (fear_greed - 50) * 0.5)
+
+    state_vector = np.array([
+        score,
+        avg_trend,
+        ema10,
+        ema30,
+        close,
+        rsi,
+        volume,
+        vwap,
+        atr,
+        ema240,
+        macd,
+        macd_signal,
+        rsi21,
+        combined_signal
+    ], dtype=np.float32)
+
+    add_debug_log("StateVector", "생성", f"{df.index[idx]} 상태벡터 생성됨: {state_vector}")
+
+    return state_vector

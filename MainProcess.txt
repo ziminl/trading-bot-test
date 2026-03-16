@@ -1,0 +1,320 @@
+#!/usr/bin/env python3
+import sys, time, threading, os, random, schedule, json
+import pandas as pd, numpy as np, torch
+from rich.console import Console
+from rich.table import Table
+from FusionRLAgent import HybridRLAgent
+from ModelHub import ModelHub
+from config import MIN_HOLD_TIME, SYMBOL_CONFIG, DEFAULT_MARKET_REGIME
+from UtilityModule import setup_logger, add_debug_log, get_wallet_balance, get_realtime_price, get_candle_data_v5, execute_order_api, get_positions, calculate_order_qty, calculate_atr_from_symbol, get_orderbook_data, generate_state_vector
+
+DEFAULT_MARKET_REGIME = "neutral"
+HEARTBEAT_TIMEOUT = 60
+INITIAL_SEED_FILE = "initial_seed.txt"
+
+def update_heartbeat(thread_name):
+    global HEARTBEATS
+    HEARTBEATS[thread_name] = time.time()
+
+def load_initial_seed():
+    if os.path.exists(INITIAL_SEED_FILE):
+        try:
+            with open(INITIAL_SEED_FILE, "r") as f:
+                seed = float(f.read().strip())
+                add_debug_log("Seed", "Load", f"초기 시드: {seed:.2f} USDT")
+                return seed
+        except Exception as e:
+            add_debug_log("Seed", "Error", f"초기 시드 로드 실패: {e}")
+    seed = get_wallet_balance()
+    try:
+        with open(INITIAL_SEED_FILE, "w") as f:
+            f.write(str(seed))
+        add_debug_log("Seed", "Save", f"초기 시드 저장됨: {seed:.2f} USDT")
+    except Exception as e:
+        add_debug_log("Seed", "Error", f"초기 시드 저장 실패: {e}")
+    return seed
+
+INITIAL_SEED = load_initial_seed()
+
+class OnlineTrader:
+    def __init__(self, fusion_rl_agent, lstm_model, initial_seed, stop_event, trades):
+        self.rl_agent = fusion_rl_agent
+        self.lstm_model = lstm_model
+        self.initial_seed = initial_seed
+        self.stop_event = stop_event
+        self.active_positions = {}
+        self.trades = trades
+        self.trading_fee = 0.075
+        self.load_positions()
+        exchange_positions = get_positions()
+        for pos in exchange_positions:
+            symbol = pos["symbol"]
+            if symbol not in self.active_positions:
+                self.active_positions[symbol] = {
+                    "entry_price": float(pos["entryPrice"]),
+                    "qty": float(pos["size"]),
+                    "side": "long" if pos["side"] == "Buy" else "short",
+                    "timestamp": time.time(),
+                    "max_roi": 0,
+                    "half_exit_done": False
+                }
+        add_debug_log("OnlineTrader", "포지션 복원", f"{len(exchange_positions)} 포지션 복원 완료")
+
+    def save_positions(self):
+        with open("active_positions.json", "w") as f:
+            json.dump(self.active_positions, f)
+
+    def load_positions(self):
+        if os.path.exists("active_positions.json"):
+            with open("active_positions.json", "r") as f:
+                self.active_positions = json.load(f)
+            add_debug_log("OnlineTrader", "포지션 로드", "저장된 포지션 불러옴.")
+
+    def sync_positions_with_exchange(self):
+        exchange_positions = get_positions()
+        exchange_symbols = {pos["symbol"] for pos in exchange_positions}
+        for sym in list(self.active_positions.keys()):
+            if sym not in exchange_symbols:
+                exit_price = get_realtime_price(sym)
+                entry_price = self.active_positions[sym]["entry_price"]
+                leverage = SYMBOL_CONFIG.get(sym, {}).get("leverage", 75)
+                if self.active_positions[sym]["side"] == "long":
+                    raw_roi = ((exit_price - entry_price) / entry_price) * leverage * 100
+                else:
+                    raw_roi = ((entry_price - exit_price) / entry_price) * leverage * 100
+                net_roi = raw_roi - (self.trading_fee * 2)
+                outcome = "win" if net_roi > 0 else "loss"
+                for trade in reversed(self.trades):
+                    if trade["symbol"] == sym and (trade.get("exit_price") is None or trade.get("exit_price") == "-"):
+                        trade["exit_price"] = exit_price
+                        trade["exit_time"] = time.time()
+                        trade["outcome"] = outcome
+                        add_debug_log("OnlineTrader", "수동 청산", f"{sym} 수동 청산, ROI: {net_roi:.2f}%")
+                        self.rl_agent.remember(sym, entry_price, exit_price, self.active_positions[sym]["side"], None, None, None, done=1)
+                        break
+                del self.active_positions[sym]
+
+def run_loop(self, stop_event):
+    symbols = list(SYMBOL_CONFIG.keys())
+    seq_len = 10
+    market_regime = DEFAULT_MARKET_REGIME
+    while not stop_event.is_set():
+        for symbol in symbols:
+            if symbol in self.active_positions:
+                continue
+            state = generate_state_vector(symbol, lstm_model=self.lstm_model, position_info=None)
+            state_seq = np.tile(state, (seq_len, 1))
+            orderbook = get_orderbook_data(symbol)
+            if orderbook:
+                bids = orderbook.get("bids", [])
+                asks = orderbook.get("asks", [])
+                if bids and asks:
+                    best_bid = float(bids[0]["price"])
+                    best_ask = float(asks[0]["price"])
+                    spread = best_ask - best_bid
+                    current_price = get_realtime_price(symbol)
+                    atr_value = calculate_atr_from_symbol(symbol, interval="5", limit=100)
+                    dynamic_threshold = current_price * 0.005 + atr_value * 0.5
+                    if spread > dynamic_threshold:
+                        add_debug_log("OnlineTrader", "진입 보류", f"{symbol} 주문장 스프레드 {spread/current_price*100:.2f}% → 진입 보류", level="warning")
+                        continue
+            else:
+                current_price = get_realtime_price(symbol)
+            atr_value = calculate_atr_from_symbol(symbol, interval="5", limit=100)
+            if atr_value < current_price * 0.001:
+                add_debug_log("OnlineTrader", "진입 보류", f"{symbol} 낮은 변동성 (ATR: {atr_value:.4f}) → 진입 보류", level="info")
+                continue
+            action = self.rl_agent.get_action(state_seq, market_regime=market_regime, current_step=int(time.time()))
+            if action == 4:
+                continue
+            qty = calculate_order_qty(current_price)
+            if qty <= 0:
+                add_debug_log("OnlineTrader", "예외", f"{symbol} 주문 수량 0 → 주문 안 함", level="error")
+                continue
+            entry_order_type = "Long Entry" if action == 0 else "Short Entry"
+            order_response = execute_order_api(symbol, entry_order_type, qty)
+            if order_response.get("retCode") == 0:
+                entry_price = get_realtime_price(symbol)
+                self.active_positions[symbol] = {
+                    "entry_price": entry_price,
+                    "qty": qty,
+                    "side": "long" if action == 0 else "short",
+                    "timestamp": time.time(),
+                    "max_roi": 0,
+                    "half_exit_done": False
+                }
+                add_debug_log("OnlineTrader", "진입", f"{symbol} {('Long' if action==0 else 'Short')} 진입 at {entry_price}")
+                self.trades.append({
+                    "symbol": symbol,
+                    "entry_price": entry_price,
+                    "side": "long" if action == 0 else "short",
+                    "qty": qty,
+                    "entry_time": time.time(),
+                    "exit_price": None,
+                    "exit_time": None,
+                    "outcome": None
+                })
+        for sym, pos in list(self.active_positions.items()):
+            current_price = get_realtime_price(sym)
+            if current_price <= 0:
+                continue
+            leverage = SYMBOL_CONFIG.get(sym, {}).get("leverage", 75)
+            atr_value = calculate_atr_from_symbol(sym, interval="5", limit=100)
+            if pos["side"] == "long":
+                raw_roi = ((current_price - pos["entry_price"]) / pos["entry_price"]) * leverage * 100
+            else:
+                raw_roi = ((pos["entry_price"] - current_price) / pos["entry_price"]) * leverage * 100
+            net_roi = raw_roi - (0.075 * leverage * 2)
+            pos["max_roi"] = max(pos.get("max_roi", net_roi), net_roi)
+            position_age = time.time() - pos["timestamp"]
+            position_info = {"side": pos["side"], "unrealized_roi": net_roi, "position_age": position_age}
+            state = generate_state_vector(sym, lstm_model=self.lstm_model, position_info=position_info)
+            state_seq = np.tile(state, (seq_len, 1))
+            if net_roi >= 50 and not pos.get("half_exit_done", False):
+                half_qty = pos["qty"] / 2
+                if half_qty > 0:
+                    exit_order_type = "Long Exit" if pos["side"] == "long" else "Short Exit"
+                    order_response = execute_order_api(sym, exit_order_type, half_qty, reduce_only=True)
+                    if order_response.get("retCode") == 0:
+                        add_debug_log("OnlineTrader", "PartialExit", f"{sym} 절반 익절 at {current_price}, ROI={net_roi:.2f}%")
+                        pos["qty"] = pos["qty"] / 2
+                        pos["half_exit_done"] = True
+                        partial_state_seq = state_seq
+                        self.rl_agent.remember(sym, pos["entry_price"], current_price, pos["side"],
+                                               partial_state_seq, action, partial_state_seq, done=0, current_step=int(time.time()))
+            if pos["max_roi"] > 10 and (pos["max_roi"] - net_roi) > 0.3 * pos["max_roi"]:
+                exit_order_type = "Long Exit" if pos["side"] == "long" else "Short Exit"
+                order_response = execute_order_api(sym, exit_order_type, pos["qty"], reduce_only=True)
+                if order_response.get("retCode") == 0:
+                    exit_price = get_realtime_price(sym)
+                    add_debug_log("OnlineTrader", "TrailingStop", f"{sym} 트레일링 스탑 청산 at {exit_price}, ROI={net_roi:.2f}%")
+                    full_state_seq = state_seq
+                    self.rl_agent.remember(sym, pos["entry_price"], exit_price, pos["side"],
+                                           full_state_seq, action, full_state_seq, done=0, current_step=int(time.time()))
+                    for trade in reversed(self.trades):
+                        if trade["symbol"] == sym and (trade.get("exit_price") is None or trade.get("exit_price") == "-"):
+                            trade["exit_price"] = exit_price
+                            trade["exit_time"] = time.time()
+                            trade["outcome"] = "win" if net_roi > 0 else "loss"
+                            break
+                    del self.active_positions[sym]
+        self.sync_positions_with_exchange()
+        time.sleep(5)
+
+def periodic_save_state(rl_agent, lstm_model):
+    rl_agent.save()
+    try:
+        lstm_model.save()
+    except Exception as e:
+        add_debug_log("PeriodicSave", "Error", f"LSTM 저장 실패: {e}", level="critical")
+    add_debug_log("PeriodicSave", "Complete", "주기적 상태 저장 완료", level="info")
+
+def display_dashboard(active_positions, trades, rl_agent, stop_event):
+    from rich.console import Console
+    from rich.table import Table
+    console = Console()
+    while not stop_event.is_set():
+        console.clear()
+        balance = get_wallet_balance()
+        total_trades = len(trades)
+        wins = len([t for t in trades if t.get("outcome") == "win"])
+        losses = len([t for t in trades if t.get("outcome") == "loss"])
+        win_rate = (wins / total_trades * 100) if total_trades else 0
+        epsilon = rl_agent.epsilon
+        summary_table = Table(title="실시간 매매 대시보드", style="cyan")
+        summary_table.add_column("항목", style="bold")
+        summary_table.add_column("값", justify="right")
+        summary_table.add_row("잔고 (USDT)", f"{balance:.2f}")
+        summary_table.add_row("총 거래 수", str(total_trades))
+        summary_table.add_row("승리", str(wins))
+        summary_table.add_row("패배", str(losses))
+        summary_table.add_row("승률 (%)", f"{win_rate:.2f}%")
+        summary_table.add_row("탐색률 (ε)", f"{epsilon:.3f}")
+        console.print(summary_table)
+        if active_positions:
+            pos_table = Table(title="활성 포지션", style="magenta")
+            pos_table.add_column("종목")
+            pos_table.add_column("진입가")
+            pos_table.add_column("현재가")
+            pos_table.add_column("방향")
+            pos_table.add_column("수량")
+            pos_table.add_column("ROI (%)")
+            for sym, pos in active_positions.items():
+                current_price = get_realtime_price(sym)
+                roi = ((current_price - pos["entry_price"]) / pos["entry_price"]) * SYMBOL_CONFIG.get(sym, {}).get("leverage", 75) * 100
+                roi = roi if pos["side"] == "long" else -roi
+                pos_table.add_row(sym, f"{pos['entry_price']:.4f}", f"{current_price:.4f}", pos["side"].upper(), str(pos["qty"]), f"{roi:.2f}%")
+            console.print(pos_table)
+        else:
+            console.print("현재 활성 포지션 없음")
+        if trades:
+            trade_table = Table(title="최근 거래 내역", style="green")
+            trade_table.add_column("종목")
+            trade_table.add_column("진입가")
+            trade_table.add_column("청산가")
+            trade_table.add_column("방향")
+            trade_table.add_column("ROI (%)")
+            trade_table.add_column("결과")
+            for trade in trades[-5:]:
+                exit_price = trade["exit_price"] if trade["exit_price"] else "-"
+                if exit_price != "-":
+                    roi = (float(exit_price) - trade["entry_price"]) / trade["entry_price"] * 100
+                    roi = roi if trade["side"] == "long" else -roi
+                    roi = f"{roi:.2f}%"
+                else:
+                    roi = "-"
+                trade_table.add_row(trade["symbol"], f"{trade['entry_price']:.4f}", str(exit_price), trade["side"].upper(), roi, trade["outcome"] if trade["outcome"] else "-")
+            console.print(trade_table)
+        else:
+            console.print("최근 거래 내역 없음")
+        time.sleep(5)
+
+def main():
+    setup_logger("q1.log")
+    initial_seed = get_wallet_balance()
+    trades = []
+    fusion_rl_agent = HybridRLAgent(state_dim=17, action_dim=5, lr=1e-3, gamma=0.98)
+    stop_event = threading.Event()
+    model_hub = ModelHub()
+    lstm_model = model_hub.get_model()
+    trader = OnlineTrader(fusion_rl_agent, lstm_model, initial_seed, stop_event, trades)
+    threads_info = {
+        "OnlineTrader": (trader.run_loop, (stop_event,)),
+        "Dashboard": (display_dashboard, (trader.active_positions, trades, fusion_rl_agent, stop_event))
+    }
+    threads = {}
+    for name, (target, args) in threads_info.items():
+        t = threading.Thread(target=target, args=args, name=name, daemon=True)
+        t.start()
+        threads[name] = t
+        add_debug_log("MainProcess", "스레드 시작", f"{name} 스레드 시작됨")
+    schedule.every(10).minutes.do(lambda: periodic_save_state(fusion_rl_agent, lstm_model))
+    try:
+        while True:
+            schedule.run_pending()
+            stop_event.wait(5)
+            current_time = time.time()
+            for name, thread in list(threads.items()):
+                last_hb = HEARTBEATS.get(name, current_time)
+                if current_time - last_hb > HEARTBEAT_TIMEOUT:
+                    add_debug_log("MainProcess", "경고", f"{name} heartbeat stale, 재시작 시도", level="critical")
+                    target, args = threads_info[name]
+                    new_thread = threading.Thread(target=target, args=args, name=name, daemon=True)
+                    new_thread.start()
+                    threads[name] = new_thread
+                    add_debug_log("MainProcess", "스레드 재시작", f"{name} 재시작 완료")
+    except KeyboardInterrupt:
+        add_debug_log("MainProcess", "종료", "KeyboardInterrupt 발생, 모든 스레드 종료", level="critical")
+        stop_event.set()
+        for t in threads.values():
+            t.join()
+        sys.exit(0)
+    except Exception as e:
+        add_debug_log("MainProcess", "치명적오류", f"main() 예외 발생: {e}", level="critical")
+        stop_event.set()
+        for t in threads.values():
+            t.join()
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
